@@ -38,6 +38,9 @@ const CHROME_PATH = process.env.CHROME_PATH || '/usr/bin/google-chrome';
 const DEBUG_PORT = parseInt(process.env.DEBUG_PORT || '9223', 10);
 const DRY_RUN = process.env.DRY_RUN === '1';
 
+/** 当前正在处理的账号 —— control.katabump.com 独立登录时要用 */
+let CURRENT_USER = { username: '', password: '' };
+
 /** 检查某个端口上是否有服务在监听 */
 async function checkPort(port) {
     return new Promise((resolve) => {
@@ -234,13 +237,105 @@ async function readServerStatus(page) {
     return 'unknown';
 }
 
-/** 找并点击启动按钮 */
+/**
+ * 从 "Access server" 标签页跳到真正的控制面板。
+ *
+ * ⚠️ KataBump 的页面结构（实测截图确认）：
+ *    - dashboard.katabump.com/server/xxx 的 "🚀 Access server" 标签页里
+ *      只有 Link / Identifier / Current password 和一个 "Go to server" 按钮
+ *    - **没有** Start / Power 按钮，也看不到运行状态
+ *    - 真正的控制面板在 Link 字段指向的地址：
+ *      https://control.katabump.com/server/<identifier>
+ *      那里才有 Start / Stop / Power 按钮和运行状态
+ *
+ * 所以流程是：dashboard 服务器页 → 切 Access server 标签 → 读 Link → 跳 control 面板
+ */
+async function gotoControlPanel(page) {
+    // 方案 1：直接点 "Go to server" 按钮（它会跳到 control 面板）
+    try {
+        const btn = page.getByRole('button', { name: 'Go to server', exact: true });
+        await btn.first().waitFor({ state: 'visible', timeout: 4000 });
+        await btn.first().click();
+        await page.waitForTimeout(4000);
+        if (page.url().includes('control.katabump.com')) {
+            console.log('   >> 已通过 "Go to server" 跳到控制面板');
+            await ensureControlLogin(page);
+            return true;
+        }
+    } catch (e) { /* 试下一招 */ }
+
+    // 方案 2：从 Link 字段读地址直接跳
+    try {
+        const link = await page.evaluate(() => {
+            const els = Array.from(document.querySelectorAll('input[readonly],code,pre,span,div'));
+            for (const el of els) {
+                const v = (el.value || el.textContent || '').trim();
+                if (/^https:\/\/control\.katabump\.com\/server\//.test(v)) return v;
+            }
+            return '';
+        });
+        if (link) {
+            console.log('   >> 控制面板地址:', link);
+            await page.goto(link, { waitUntil: 'domcontentloaded', timeout: 30000 });
+            await page.waitForTimeout(3000);
+            console.log('   >> 已跳转到控制面板');
+            await ensureControlLogin(page);
+            return true;
+        }
+    } catch (e) { /* ignore */ }
+
+    // 方案 3：直接在 dashboard 上找 Start 按钮（老版面板结构，兼容）
+    console.log('   >> ⚠️ 未能跳到控制面板，尝试在当前页直接找启动按钮');
+    return false;
+}
+
+/**
+ * control.katabump.com 是独立域名，可能需要单独登录。
+ * 如果跳过去发现是登录页，就用同一套凭据登录一次。
+ */
+async function ensureControlLogin(page) {
+    try {
+        const url = page.url();
+        const body = await page.locator('body').innerText().catch(() => '');
+        const needsLogin = /login|sign in/i.test(url) ||
+            (/\bpassword\b/i.test(body) && !/start|stop|power/i.test(body));
+        if (!needsLogin) return true;
+
+        console.log('   >> 控制面板需要登录，尝试用同一套凭据登录...');
+        const emailInput = page.getByRole('textbox', { name: 'Email' });
+        await emailInput.waitFor({ state: 'visible', timeout: 5000 });
+        await emailInput.fill(CURRENT_USER.username);
+        const pwdInput = page.getByRole('textbox', { name: 'Password' });
+        await pwdInput.fill(CURRENT_USER.password);
+        await page.waitForTimeout(500);
+
+        for (let a = 0; a < 12; a++) {
+            if (await attemptTurnstileCdp(page)) break;
+            await page.waitForTimeout(1000);
+        }
+        await page.getByRole('button', { name: 'Login', exact: true }).click();
+        await page.waitForTimeout(4000);
+        console.log('   >> 控制面板登录完成，当前地址:', page.url());
+        return true;
+    } catch (e) {
+        console.log('   >> 控制面板登录处理异常:', e.message);
+        return false;
+    }
+}
+
+/**
+ * 找并点击启动按钮（在 control.katabump.com 控制面板上）。
+ *
+ * 实测按钮文案可能是 Start / Power On / Start server / Boot 等，
+ * 下面覆盖常见几种，并且用 JS 兜底做模糊匹配。
+ */
 async function clickStart(page) {
     const candidates = [
         page.getByRole('button', { name: 'Start', exact: true }),
-        page.getByRole('button', { name: /start/i }),
-        page.getByRole('button', { name: 'Power', exact: true }),
+        page.getByRole('button', { name: 'Start server', exact: true }),
         page.getByRole('button', { name: 'Power On', exact: true }),
+        page.getByRole('button', { name: 'Power', exact: true }),
+        page.getByRole('button', { name: /start/i }),
         page.getByRole('button', { name: /power/i }),
         page.getByRole('link', { name: /start/i }),
         page.getByText(/^start$/i),
@@ -251,12 +346,34 @@ async function clickStart(page) {
             await c.first().waitFor({ state: 'visible', timeout: 2500 });
             const visible = await c.first().isVisible();
             if (visible) {
-                console.log('   >> 找到启动按钮，点击中...');
+                const label = await c.first().innerText().catch(() => '');
+                console.log('   >> 找到启动按钮:', (label || '').trim(), '点击中...');
                 await c.first().click();
                 return true;
             }
         } catch (e) { /* try next */ }
     }
+
+    // 兜底：JS 直接点含 start / power 的按钮
+    try {
+        const clicked = await page.evaluate(() => {
+            const els = Array.from(document.querySelectorAll('button,a,[role="button"]'));
+            const hit = els.find((el) => {
+                const t = (el.innerText || el.textContent || '').trim().toLowerCase();
+                if (!t || t.length > 30) return false;
+                if (/\b(delete|renew|cancel|close|save|change|order|buy)\b/.test(t)) return false;
+                return /start|power|boot|launch|run/.test(t);
+            });
+            if (!hit) return false;
+            hit.click();
+            return true;
+        });
+        if (clicked) {
+            console.log('   >> 找到启动按钮（JS 兜底），点击中...');
+            return true;
+        }
+    } catch (e) { /* ignore */ }
+
     return false;
 }
 
@@ -354,6 +471,8 @@ async function clickStart(page) {
         const user = users[i];
         console.log(`\n=== 正在处理用户 ${i + 1}/${users.length} ===`);
         const safeUser = (user.username || 'user').replace(/[^a-z0-9]/gi, '_');
+        // 记下当前账号，控制面板（独立域名）要单独登录时要用
+        CURRENT_USER = { username: user.username || '', password: user.password || '' };
 
         try {
             if (page.isClosed()) {
@@ -430,10 +549,13 @@ async function clickStart(page) {
                 continue;
             }
 
-            // --- 读状态 ---
-            // 必须先切到 "Access server" 标签页 —— 状态和 Start 按钮都在那里
+            // --- 切到 Access server 标签页，拿控制面板地址 ---
             await switchToAccessServerTab(page);
 
+            // --- 跳到真正的控制面板（Start/Stop 按钮和状态都在那边）---
+            await gotoControlPanel(page);
+
+            // --- 读状态 ---
             let status = await readServerStatus(page);
             console.log('   >> 当前状态:', status);
 
@@ -475,9 +597,13 @@ async function clickStart(page) {
                 await page.waitForTimeout(5000);
                 try {
                     await page.reload({ waitUntil: 'domcontentloaded' });
-                    await page.waitForTimeout(2000);
-                    // reload 后页面回到默认的 General 标签，要重新切过去
-                    await switchToAccessServerTab(page);
+                    await page.waitForTimeout(2500);
+                    // 万一被重定向回 dashboard，重新走一遍到控制面板的流程
+                    if (!page.url().includes('control.katabump.com')) {
+                        console.log('   >> 被重定向了，重新进入控制面板...');
+                        await switchToAccessServerTab(page);
+                        await gotoControlPanel(page);
+                    }
                 } catch (e) { /* ignore */ }
                 finalStatus = await readServerStatus(page);
                 console.log(`   >> 等待中... 状态: ${finalStatus}`);
