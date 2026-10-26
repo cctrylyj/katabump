@@ -21,8 +21,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 40
 
+    # ⚠️ 必须显式声明写权限，否则 git push 会 403
+    #    （fork 出来的仓库默认 GITHUB_TOKEN 是只读的）
+    permissions:
+      contents: write
+
     steps:
     - uses: actions/checkout@v4
+      with:
+        # 需要 push 订阅文件，必须带完整历史
+        fetch-depth: 0
 
     - name: Setup Node.js
       uses: actions/setup-node@v4
@@ -54,6 +62,26 @@ jobs:
         TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
         TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
       run: xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" node auto_start.js
+
+    # =====================================================================
+    # 下载 xray 客户端（端口回测用）
+    # ---------------------------------------------------------------------
+    # 仓库里不放二进制（35MB，会让仓库变重），
+    # 每次跑 CI 时从 Xray 官方 release 下载对应平台版本。
+    # 版本必须与服务端一致（当前 26.10.21）。
+    # =====================================================================
+    - name: Download xray
+      run: |
+        set -e
+        VER="v26.10.21"
+        echo "下载 xray $VER ..."
+        curl -fsSL -o xray.zip \
+          "https://github.com/XTLS/Xray-core/releases/download/${VER}/Xray-linux-64.zip"
+        unzip -o xray.zip -d xray_tmp >/dev/null
+        cp xray_tmp/xray ./xray-linux-amd64
+        chmod +x ./xray-linux-amd64
+        rm -rf xray_tmp xray.zip
+        ./xray-linux-amd64 version
 
     # =====================================================================
     # 刷新订阅（关键步骤）
@@ -88,8 +116,13 @@ jobs:
           echo "订阅无变化，无需提交"
         else
           git commit -m "chore: refresh subscription ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
-          git push
-          echo "订阅已更新并推送"
+          if git push; then
+            echo "订阅已更新并推送"
+          else
+            echo "::error::git push 失败 —— 订阅没有更新到仓库！"
+            echo "::error::检查 workflow 的 permissions.contents 是否为 write"
+            exit 1
+          fi
         fi
 
     - name: Upload Screenshots
