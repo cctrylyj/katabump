@@ -46,7 +46,7 @@ let CURRENT_USER = { username: '', password: '' };
  * ⚠️ control.katabump.com 的登录密码是服务器的 "Current password"，
  *    不是 KataBump 账号密码。
  */
-let SERVER_CREDENTIALS = { identifier: '', password: '', link: '' };
+let SERVER_CREDENTIALS = { identifier: '', password: '', link: '', serverId: '', hexIds: [] };
 
 /** 检查某个端口上是否有服务在监听 */
 async function checkPort(port) {
@@ -328,23 +328,41 @@ async function readServerCredentials(page) {
                 }
             }
 
-            // --- 策略 3：从任意位置抓 control.katabump.com 的 URL ---
+            // --- 策略 3：从 input 的 value 或全文里抓 control.katabump.com 的 URL ---
+            // ⚠️ 注意：input 的 value **不会**出现在 innerText 里，
+            //    所以必须单独扫 input.value（实测就是这样漏掉的）
+            if (!out.link) {
+                for (const x of inputVals) {
+                    const m = x.v.match(/https:\/\/control\.katabump\.com\/[^\s"'<>]+/);
+                    if (m) { out.link = m[0]; break; }
+                }
+            }
             if (!out.link) {
                 const m = (document.body.innerText || '')
                     .match(/https:\/\/control\.katabump\.com\/[^\s"'<>]+/);
                 if (m) out.link = m[0];
             }
-            // --- 策略 4：从 Identifier 推 Link（路径尾段是 identifier）---
-            if (!out.link && out.identifier) {
-                // Link 的路径尾段和 Identifier 不同（77f51fce vs c1771abb34b6161），
-                // 所以这里不做推算，保持为空
+            // --- 策略 4：Link 路径尾段就是真实的服务器 ID（Your ID）---
+            // Pterodactyl 控制面板的 Your ID = /server/<id> 里的 <id>
+            if (out.link) {
+                const m = out.link.match(/\/server\/([^/?#]+)/);
+                if (m) out.serverId = m[1];
             }
+
+            // --- 策略 5：兜底 —— 所有看起来像十六进制 ID 的 input 值都当候选 ---
+            // 页面上 General 页的 Identifier 也是 input value（灰底），
+            // 不一定带 aria-label，hint 策略抓不到。
+            out.hexIds = inputVals
+                .map((x) => x.v)
+                .filter((v) => /^[0-9a-f]{6,32}$/i.test(v));
 
             return out;
         });
         creds.identifier = found.identifier || '';
         creds.password = found.password || '';
         creds.link = found.link || '';
+        creds.serverId = found.serverId || '';
+        creds.hexIds = found.hexIds || [];
     } catch (e) {
         console.log('   >> 读取服务器凭据异常:', e.message);
     }
@@ -445,12 +463,16 @@ async function ensureControlLogin(page) {
         // 但也不排除平台改版成用账号密码，所以把各种组合都试一遍。
         const ids = [];
         const push = (v) => { if (v && !ids.includes(v)) ids.push(v); };
-        push(SERVER_CREDENTIALS.identifier);
-        // Link 路径尾段（如 /server/77f51fce -> 77f51fce）
+        // ⚠️ Your ID 优先用 Link 路径尾段（Pterodactyl 的 /server/<id>），
+        //    实测报 "No account matching those credentials" 就是因为用了 Identifier。
+        push(SERVER_CREDENTIALS.serverId);
         if (SERVER_CREDENTIALS.link) {
             const m = SERVER_CREDENTIALS.link.match(/\/server\/([^/?#]+)/);
             if (m) push(m[1]);
         }
+        push(SERVER_CREDENTIALS.identifier);
+        // 其它十六进制串也可能是 ID（General 页的 Identifier 就是 input value）
+        for (const h of (SERVER_CREDENTIALS.hexIds || [])) push(h);
         push(CURRENT_USER.username);
 
         const pwds = [];
@@ -791,7 +813,25 @@ async function clickStart(page) {
             SERVER_CREDENTIALS = await readServerCredentials(page);
             console.log('   >> 服务器凭据:',
                 'identifier=' + (SERVER_CREDENTIALS.identifier || '(未读到)'),
-                'password=' + (SERVER_CREDENTIALS.password ? '(已读到)' : '(未读到)'));
+                'serverId=' + (SERVER_CREDENTIALS.serverId || '(未读到)'),
+                'password=' + (SERVER_CREDENTIALS.password ? '(已读到)' : '(未读到)'),
+                'link=' + (SERVER_CREDENTIALS.link ? '(已读到)' : '(未读到)'));
+
+            // 诊断：把页面上所有可见行 + input 值 dump 出来，
+            // 这样一眼就能看出哪个字段被读错了
+            try {
+                const raw = await page.evaluate(() => {
+                    const lines = (document.body.innerText || '')
+                        .split('\n').map(s => s.trim()).filter(Boolean).slice(0, 40);
+                    const inputs = Array.from(document.querySelectorAll('input'))
+                        .map((el, i) => `#${i} name="${el.name || ''}" id="${el.id || ''}" ` +
+                            `aria="${el.getAttribute('aria-label') || ''}" value="${(el.value || '').slice(0, 60)}"`)
+                        .slice(0, 20);
+                    return { lines, inputs };
+                });
+                console.log('   >> [诊断] 页面可见行:', JSON.stringify(raw.lines));
+                console.log('   >> [诊断] input 元素:', JSON.stringify(raw.inputs, null, 1));
+            } catch (e) { /* ignore */ }
 
             // --- 跳到真正的控制面板（Start/Stop 按钮和状态都在那边）---
             // ⚠️ 它会返回「真正要操作的 page」—— "Go to server" 是在新标签页打开的，
