@@ -260,16 +260,14 @@ async function gotoControlPanel(page) {
         await page.waitForTimeout(5000);
         if (page.url().includes('control.katabump.com')) {
             console.log('   >> 已通过 "Go to server" 跳到控制面板');
-            await ensureControlLogin(page);
-            return true;
+            return page;
         }
-        // 可能在新标签页打开了
+        // 可能在新标签页打开了 —— 这是实测到的情况
         const pages = page.context().pages();
         const ctrl = pages.find((p) => p.url().includes('control.katabump.com'));
         if (ctrl) {
             console.log('   >> 控制面板在新标签页打开了');
-            await ensureControlLogin(ctrl);
-            return true;
+            return ctrl;
         }
     } catch (e) { /* 试下一招 */ }
 
@@ -292,8 +290,7 @@ async function gotoControlPanel(page) {
             await page.goto(link, { waitUntil: 'domcontentloaded', timeout: 30000 });
             await page.waitForTimeout(4000);
             console.log('   >> 已跳转到控制面板');
-            await ensureControlLogin(page);
-            return true;
+            return page;
         }
     } catch (e) { /* ignore */ }
 
@@ -315,7 +312,7 @@ async function gotoControlPanel(page) {
         });
         console.log('   >> 页面上出现的 katabump 链接:', JSON.stringify(urls, null, 1));
     } catch (e) { /* ignore */ }
-    return false;
+    return page;
 }
 
 /**
@@ -326,28 +323,99 @@ async function ensureControlLogin(page) {
     try {
         const url = page.url();
         const body = await page.locator('body').innerText().catch(() => '');
-        const needsLogin = /login|sign in/i.test(url) ||
+        // 已经能看到 Start / Stop / Power，说明已登录，压根不需要这一步
+        if (/start server|power on|stop server|\bstart\b|\bstop\b|\bpower\b/i.test(body)) {
+            console.log('   >> 控制面板已登录（能看到启动/停止控件）');
+            return true;
+        }
+        const needsLogin = /login|sign ?in/i.test(url) ||
             (/\bpassword\b/i.test(body) && !/start|stop|power/i.test(body));
         if (!needsLogin) return true;
 
         console.log('   >> 控制面板需要登录，尝试用同一套凭据登录...');
-        const emailInput = page.getByRole('textbox', { name: 'Email' });
-        await emailInput.waitFor({ state: 'visible', timeout: 5000 });
-        await emailInput.fill(CURRENT_USER.username);
-        const pwdInput = page.getByRole('textbox', { name: 'Password' });
-        await pwdInput.fill(CURRENT_USER.password);
-        await page.waitForTimeout(500);
+        // 表单标签不一定是 "Email"（可能是 Username / Email address），
+        // 所以按顺序试多个定位方式，都不行就按 DOM 顺序取第一个 textbox + 第一个 password
+        const emailCandidates = [
+            page.getByRole('textbox', { name: 'Email' }),
+            page.getByRole('textbox', { name: /email/i }),
+            page.getByRole('textbox', { name: /user(name)?/i }),
+            page.locator('input[type="email"]'),
+            page.locator('input[name*="email" i]'),
+            page.locator('input[name*="user" i]'),
+        ];
+        let filled = false;
+        for (const c of emailCandidates) {
+            try {
+                await c.first().waitFor({ state: 'visible', timeout: 2500 });
+                await c.first().fill(CURRENT_USER.username);
+                filled = true;
+                break;
+            } catch (e) { /* try next */ }
+        }
+        if (!filled) {
+            // 最后兜底：按 DOM 顺序
+            const inputs = await page.$$('input');
+            if (inputs.length >= 2) {
+                await inputs[0].click({ clickCount: 3 });
+                await inputs[0].type(CURRENT_USER.username);
+                filled = true;
+            }
+        }
+        if (!filled) throw new Error('找不到用户名输入框');
 
+        const pwdCandidates = [
+            page.getByRole('textbox', { name: 'Password' }),
+            page.getByRole('textbox', { name: /password/i }),
+            page.locator('input[type="password"]'),
+        ];
+        let pwdFilled = false;
+        for (const c of pwdCandidates) {
+            try {
+                await c.first().waitFor({ state: 'visible', timeout: 2500 });
+                await c.first().fill(CURRENT_USER.password);
+                pwdFilled = true;
+                break;
+            } catch (e) { /* try next */ }
+        }
+        if (!pwdFilled) {
+            const inputs = await page.$$('input[type="password"]');
+            if (inputs.length) {
+                await inputs[0].click({ clickCount: 3 });
+                await inputs[0].type(CURRENT_USER.password);
+                pwdFilled = true;
+            }
+        }
+        if (!pwdFilled) throw new Error('找不到密码输入框');
+
+        await page.waitForTimeout(500);
         for (let a = 0; a < 12; a++) {
             if (await attemptTurnstileCdp(page)) break;
             await page.waitForTimeout(1000);
         }
-        await page.getByRole('button', { name: 'Login', exact: true }).click();
-        await page.waitForTimeout(4000);
+        // 登录按钮文案可能是 Login / Sign in / Log in
+        const loginBtns = [
+            page.getByRole('button', { name: 'Login', exact: true }),
+            page.getByRole('button', { name: /log\s*in/i }),
+            page.getByRole('button', { name: /sign\s*in/i }),
+            page.locator('input[type="submit"]'),
+        ];
+        for (const b of loginBtns) {
+            try {
+                await b.first().waitFor({ state: 'visible', timeout: 2500 });
+                await b.first().click();
+                break;
+            } catch (e) { /* try next */ }
+        }
+        await page.waitForTimeout(5000);
         console.log('   >> 控制面板登录完成，当前地址:', page.url());
         return true;
     } catch (e) {
         console.log('   >> 控制面板登录处理异常:', e.message);
+        // 失败也把当前页文本 dump 出来，便于诊断
+        try {
+            const body = await page.locator('body').innerText().catch(() => '');
+            console.log('   >> 控制面板页面文本:', body.replace(/\s+/g, ' ').slice(0, 400));
+        } catch (e2) { /* ignore */ }
         return false;
     }
 }
@@ -582,10 +650,18 @@ async function clickStart(page) {
             await switchToAccessServerTab(page);
 
             // --- 跳到真正的控制面板（Start/Stop 按钮和状态都在那边）---
-            await gotoControlPanel(page);
+            // ⚠️ 它会返回「真正要操作的 page」—— "Go to server" 是在新标签页打开的，
+            //    如果还用原来的 dashboard page，后续所有操作都作用在错的页面上。
+            const ctrlPage = await gotoControlPanel(page);
+            if (ctrlPage && ctrlPage !== page) {
+                page = ctrlPage;
+                await page.addInitScript(INJECTED_SCRIPT).catch(() => {});
+            }
+            await ensureControlLogin(page);
 
             // --- 读状态 ---
             let status = await readServerStatus(page);
+            console.log('   >> 当前地址:', page.url());
             console.log('   >> 当前状态:', status);
 
             if (status === 'running') {
@@ -631,7 +707,9 @@ async function clickStart(page) {
                     if (!page.url().includes('control.katabump.com')) {
                         console.log('   >> 被重定向了，重新进入控制面板...');
                         await switchToAccessServerTab(page);
-                        await gotoControlPanel(page);
+                        const back = await gotoControlPanel(page);
+                        if (back && back !== page) page = back;
+                        await ensureControlLogin(page);
                     }
                 } catch (e) { /* ignore */ }
                 finalStatus = await readServerStatus(page);
