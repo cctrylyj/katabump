@@ -41,6 +41,13 @@ const DRY_RUN = process.env.DRY_RUN === '1';
 /** 当前正在处理的账号 —— control.katabump.com 独立登录时要用 */
 let CURRENT_USER = { username: '', password: '' };
 
+/**
+ * 服务器专属凭据（从 "Access server" 标签页读取）。
+ * ⚠️ control.katabump.com 的登录密码是服务器的 "Current password"，
+ *    不是 KataBump 账号密码。
+ */
+let SERVER_CREDENTIALS = { identifier: '', password: '', link: '' };
+
 /** 检查某个端口上是否有服务在监听 */
 async function checkPort(port) {
     return new Promise((resolve) => {
@@ -250,6 +257,75 @@ async function readServerStatus(page) {
  *
  * 所以流程是：dashboard 服务器页 → 切 Access server 标签 → 读 Link → 跳 control 面板
  */
+/**
+ * 从 "Access server" 标签页读取服务器的登录凭据。
+ *
+ * ⚠️ 关键：控制面板（control.katabump.com）的密码**不是** KataBump 账号密码，
+ *    而是服务器专属的 "Current password"（一个十六进制串，如 9d1c8b0f884e）。
+ *    账号密码在这里登录会失败。
+ *
+ * 页面结构（实测截图）：
+ *   Link              https://control.katabump.com/server/77f51fce
+ *   Identifier        c1771abb34b6161
+ *   Current password  9d1c8b0f884e
+ *
+ * @returns {{identifier:string, password:string}}
+ */
+async function readServerCredentials(page) {
+    const creds = { identifier: '', password: '' };
+    try {
+        const found = await page.evaluate(() => {
+            const out = { identifier: '', password: '' };
+            // 策略：按 "label 文本 -> 相邻元素的值" 配对
+            const labels = Array.from(document.querySelectorAll(
+                'label,span,div,p,td,th,h6,h5,h4'));
+            for (const lab of labels) {
+                const t = (lab.textContent || '').trim().toLowerCase();
+                if (!t || t.length > 40) continue;
+
+                // 找紧邻的下一个可读值的元素
+                const grab = (el) => {
+                    if (!el) return '';
+                    const v = (el.value || el.textContent || '').trim();
+                    return v && v.length <= 64 ? v : '';
+                };
+                let val = '';
+                // 同一个容器里的兄弟节点
+                const parent = lab.parentElement;
+                if (parent) {
+                    const sibs = Array.from(parent.children).filter((c) => c !== lab);
+                    for (const s of sibs) {
+                        val = grab(s);
+                        if (val) break;
+                    }
+                }
+                if (!val) val = grab(lab.nextElementSibling);
+                if (!val) {
+                    // 再试：父容器里除 label 外的其它文本
+                    const p2 = lab.parentElement && lab.parentElement.parentElement;
+                    if (p2) {
+                        const txt = (p2.innerText || '').split('\n').map(s => s.trim()).filter(Boolean);
+                        const idx = txt.findIndex(s => s.toLowerCase() === t);
+                        if (idx >= 0 && txt[idx + 1]) val = txt[idx + 1];
+                    }
+                }
+                if (!val) continue;
+
+                if (/current password|^password$/.test(t)) out.password = val;
+                else if (/^identifier$/.test(t)) out.identifier = val;
+                else if (/^link$/.test(t)) out.link = val;
+            }
+            return out;
+        });
+        creds.identifier = found.identifier || '';
+        creds.password = found.password || '';
+        creds.link = found.link || '';
+    } catch (e) {
+        console.log('   >> 读取服务器凭据异常:', e.message);
+    }
+    return creds;
+}
+
 async function gotoControlPanel(page) {
     // 方案 1：点 "Go to server"。
     // 注意它不一定是 <button>，可能是 <a> 或 <div>，所以用 text 匹配更保险。
@@ -332,37 +408,44 @@ async function ensureControlLogin(page) {
             (/\bpassword\b/i.test(body) && !/start|stop|power/i.test(body));
         if (!needsLogin) return true;
 
-        console.log('   >> 控制面板需要登录，尝试用同一套凭据登录...');
-        // 表单标签不一定是 "Email"（可能是 Username / Email address），
-        // 所以按顺序试多个定位方式，都不行就按 DOM 顺序取第一个 textbox + 第一个 password
+        // ⚠️ 控制面板优先用服务器的 "Current password"，
+        //    账号密码在这里登录会失败（实测就是卡在这一步）。
+        const pwd = SERVER_CREDENTIALS.password || CURRENT_USER.password;
+        const idt = SERVER_CREDENTIALS.identifier || CURRENT_USER.username;
+        console.log('   >> 控制面板需要登录' +
+            (SERVER_CREDENTIALS.password ? '（使用服务器 Current password）' : '（使用账号密码）'));
+
+        // 用户名定位器
         const emailCandidates = [
             page.getByRole('textbox', { name: 'Email' }),
             page.getByRole('textbox', { name: /email/i }),
+            page.getByRole('textbox', { name: /your id/i }),
             page.getByRole('textbox', { name: /user(name)?/i }),
             page.locator('input[type="email"]'),
             page.locator('input[name*="email" i]'),
             page.locator('input[name*="user" i]'),
+            page.locator('input[name*="id" i]'),
         ];
         let filled = false;
         for (const c of emailCandidates) {
             try {
-                await c.first().waitFor({ state: 'visible', timeout: 2500 });
-                await c.first().fill(CURRENT_USER.username);
+                await c.first().waitFor({ state: 'visible', timeout: 2000 });
+                await c.first().fill(idt);
                 filled = true;
                 break;
             } catch (e) { /* try next */ }
         }
         if (!filled) {
-            // 最后兜底：按 DOM 顺序
             const inputs = await page.$$('input');
             if (inputs.length >= 2) {
                 await inputs[0].click({ clickCount: 3 });
-                await inputs[0].type(CURRENT_USER.username);
+                await inputs[0].type(idt);
                 filled = true;
             }
         }
         if (!filled) throw new Error('找不到用户名输入框');
 
+        // 密码定位器
         const pwdCandidates = [
             page.getByRole('textbox', { name: 'Password' }),
             page.getByRole('textbox', { name: /password/i }),
@@ -371,8 +454,8 @@ async function ensureControlLogin(page) {
         let pwdFilled = false;
         for (const c of pwdCandidates) {
             try {
-                await c.first().waitFor({ state: 'visible', timeout: 2500 });
-                await c.first().fill(CURRENT_USER.password);
+                await c.first().waitFor({ state: 'visible', timeout: 2000 });
+                await c.first().fill(pwd);
                 pwdFilled = true;
                 break;
             } catch (e) { /* try next */ }
@@ -381,7 +464,7 @@ async function ensureControlLogin(page) {
             const inputs = await page.$$('input[type="password"]');
             if (inputs.length) {
                 await inputs[0].click({ clickCount: 3 });
-                await inputs[0].type(CURRENT_USER.password);
+                await inputs[0].type(pwd);
                 pwdFilled = true;
             }
         }
@@ -399,19 +482,39 @@ async function ensureControlLogin(page) {
             page.getByRole('button', { name: /sign\s*in/i }),
             page.locator('input[type="submit"]'),
         ];
+        let clicked = false;
         for (const b of loginBtns) {
             try {
                 await b.first().waitFor({ state: 'visible', timeout: 2500 });
                 await b.first().click();
+                clicked = true;
                 break;
             } catch (e) { /* try next */ }
         }
+        if (!clicked) throw new Error('找不到登录按钮');
+
         await page.waitForTimeout(5000);
+        const afterUrl = page.url();
+        if (/login|sign ?in/i.test(afterUrl)) {
+            console.log('   >> ❌ 控制面板登录被拒绝，仍停在登录页');
+            // 试另一种密码：账号密码
+            if (SERVER_CREDENTIALS.password && CURRENT_USER.password) {
+                console.log('   >> 改用账号密码重试一次...');
+                try {
+                    const p = await page.$('input[type="password"]');
+                    if (p) {
+                        await p.click({ clickCount: 3 });
+                        await p.type(CURRENT_USER.password);
+                        const lb = await page.$('button[type="submit"],input[type="submit"],button');
+                        if (lb) { await lb.click(); await page.waitForTimeout(5000); }
+                    }
+                } catch (e) { /* ignore */ }
+            }
+        }
         console.log('   >> 控制面板登录完成，当前地址:', page.url());
         return true;
     } catch (e) {
         console.log('   >> 控制面板登录处理异常:', e.message);
-        // 失败也把当前页文本 dump 出来，便于诊断
         try {
             const body = await page.locator('body').innerText().catch(() => '');
             console.log('   >> 控制面板页面文本:', body.replace(/\s+/g, ' ').slice(0, 400));
@@ -646,8 +749,14 @@ async function clickStart(page) {
                 continue;
             }
 
-            // --- 切到 Access server 标签页，拿控制面板地址 ---
+            // --- 切到 Access server 标签页，拿控制面板地址和服务器密码 ---
             await switchToAccessServerTab(page);
+
+            // ⚠️ 必须在跳转之前读！Current password 只在这个标签页上有
+            SERVER_CREDENTIALS = await readServerCredentials(page);
+            console.log('   >> 服务器凭据:',
+                'identifier=' + (SERVER_CREDENTIALS.identifier || '(未读到)'),
+                'password=' + (SERVER_CREDENTIALS.password ? '(已读到)' : '(未读到)'));
 
             // --- 跳到真正的控制面板（Start/Stop 按钮和状态都在那边）---
             // ⚠️ 它会返回「真正要操作的 page」—— "Go to server" 是在新标签页打开的，
@@ -707,6 +816,7 @@ async function clickStart(page) {
                     if (!page.url().includes('control.katabump.com')) {
                         console.log('   >> 被重定向了，重新进入控制面板...');
                         await switchToAccessServerTab(page);
+                        SERVER_CREDENTIALS = await readServerCredentials(page);
                         const back = await gotoControlPanel(page);
                         if (back && back !== page) page = back;
                         await ensureControlLogin(page);
