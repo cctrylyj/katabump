@@ -27,14 +27,28 @@ const { chromium } = require('playwright-extra');
 const stealth = require('puppeteer-extra-plugin-stealth')();
 const axios = require('axios');
 const fs = require('fs');
+const http = require('http');
 const path = require('path');
 const { spawn, exec } = require('child_process');
 
 const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN;
 const TG_CHAT_ID = process.env.TG_CHAT_ID;
 const CHROME_PATH = process.env.CHROME_PATH || '/usr/bin/google-chrome';
-const DEBUG_PORT = 9222;
+// 用 9223 而不是 9222 —— 避免和 action_renew.js 在同一个 job 里抢端口
+const DEBUG_PORT = parseInt(process.env.DEBUG_PORT || '9223', 10);
 const DRY_RUN = process.env.DRY_RUN === '1';
+
+/** 检查某个端口上是否有服务在监听 */
+async function checkPort(port) {
+    return new Promise((resolve) => {
+        const req = http.get(`http://127.0.0.1:${port}/json/version`, (res) => {
+            res.resume();
+            resolve(true);
+        });
+        req.on('error', () => resolve(false));
+        req.setTimeout(2000, () => { req.destroy(); resolve(false); });
+    });
+}
 
 chromium.use(stealth);
 process.env.NO_PROXY = 'localhost,127.0.0.1';
@@ -188,52 +202,57 @@ async function clickStart(page) {
 
     // 启动 Chrome（带调试端口，方便 CDP 点击）
     console.log('检查 Chrome 是否已在端口 ' + DEBUG_PORT + ' 上运行...');
-    let chromeRunning = false;
-    try {
-        await new Promise((resolve, reject) => {
-            const req = http.get(`http://127.0.0.1:${DEBUG_PORT}/json/version`, (res) => {
-                res.resume();
-                resolve();
-            });
-            req.on('error', reject);
-            req.setTimeout(2000, () => req.destroy(new Error('timeout')));
-        });
-        chromeRunning = true;
-    } catch (e) { /* not running */ }
-
-    if (!chromeRunning) {
+    if (await checkPort(DEBUG_PORT)) {
+        console.log('Chrome 已开启。');
+    } else {
         console.log(`正在启动 Chrome (路径: ${CHROME_PATH})...`);
+        // ⚠️ 必须用独立的 user-data-dir，否则和 action_renew.js 抢同一个 profile 会起不来
         const chromeArgs = [
-            '--remote-debugging-port=' + DEBUG_PORT,
-            '--no-sandbox', '--disable-setuid-sandbox',
+            `--remote-debugging-port=${DEBUG_PORT}`,
+            '--no-first-run',
+            '--no-default-browser-check',
+            '--disable-gpu',
             '--disable-dev-shm-usage',
-            '--window-size=1920,1080',
-            '--user-data-dir=/tmp/chrome-katabump-profile',
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--window-size=1280,720',
+            '--user-data-dir=/tmp/chrome_start_user_data',
             'about:blank',
         ];
-        const proxyArgs = PROXY_CONFIG
-            ? [`--proxy-server=${PROXY_CONFIG.server}`]
-            : [];
-        const child = spawn(CHROME_PATH, [...proxyArgs, ...chromeArgs], {
-            stdio: 'ignore', detached: true,
+        if (PROXY_CONFIG) {
+            chromeArgs.push(`--proxy-server=${PROXY_CONFIG.server}`);
+            chromeArgs.push('--proxy-bypass-list=<-loopback>');
+        }
+        const child = spawn(CHROME_PATH, chromeArgs, { stdio: 'ignore', detached: true });
+        // ⚠️ 必须接住 'error' 事件：Chrome 路径不存在 / 无执行权限时
+        //    spawn 会异步抛 ENOENT，不接住就是未捕获异常直接崩进程，
+        //    根本走不到下面的诊断分支（表现为日志莫名其妙中断）。
+        child.on('error', (e) => {
+            console.error('Chrome 进程启动失败:', e.message);
         });
         child.unref();
-        for (let i = 0; i < 30; i++) {
+
+        console.log('正在等待 Chrome 初始化...');
+        for (let i = 0; i < 40; i++) {
+            if (await checkPort(DEBUG_PORT)) break;
             await new Promise((r) => setTimeout(r, 1000));
-            try {
-                await new Promise((resolve, reject) => {
-                    const req = http.get(`http://127.0.0.1:${DEBUG_PORT}/json/version`, (res) => {
-                        res.resume(); resolve();
-                    });
-                    req.on('error', reject);
-                    req.setTimeout(2000, () => req.destroy(new Error('timeout')));
-                });
-                chromeRunning = true;
-                break;
-            } catch (e) { /* retry */ }
         }
-        if (!chromeRunning) {
+
+        if (!await checkPort(DEBUG_PORT)) {
             console.error('Chrome 无法在端口 ' + DEBUG_PORT + ' 上启动');
+            try {
+                const ver = require('child_process').execSync(
+                    `${CHROME_PATH} --version 2>&1 || echo "chrome --version 执行失败"`,
+                    { encoding: 'utf8', timeout: 10000 });
+                console.error('Chrome 版本:', ver.trim());
+            } catch (e) {
+                console.error('Chrome 版本查询失败:', e.message);
+            }
+            try {
+                const ps = require('child_process').execSync('ps aux | grep -i chrome | grep -v grep | head -5', { encoding: 'utf8' });
+                console.error('Chrome 进程:', ps.trim() || '(无)');
+            } catch (e) { /* ignore */ }
+            await sendTelegram('❌ *自动启动失败*\n原因: Chrome 无法启动\n请查看 Actions 日志');
             process.exit(1);
         }
     }
