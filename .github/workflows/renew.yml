@@ -13,6 +13,7 @@ on:
           - both
           - renew
           - start
+          - refresh
         default: both
 
 jobs:
@@ -34,6 +35,7 @@ jobs:
         sudo apt-get install -y xvfb
         npm install
         npx playwright install-deps chrome
+        npx playwright install chromium
 
     - name: Run Renew Script
       env:
@@ -52,6 +54,43 @@ jobs:
         TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
         TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
       run: xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" node auto_start.js
+
+    # =====================================================================
+    # 刷新订阅（关键步骤）
+    # ---------------------------------------------------------------------
+    # 容器重装/重建时 index.js 会重新生成一整组参数
+    # （uuid / private_key / public_key / short_id 全部变），
+    # 客户端手里的旧 clash.yaml 就再也连不上了（REALITY authentication failed）。
+    # 这一步把容器里的最新参数拉回来，重写 clash.yaml / sub.txt，
+    # 并且只保留真正能从公网连通的端口，然后 commit 回去。
+    # 用户端订阅地址指向 raw.githubusercontent.com，会自动拿到新参数。
+    # =====================================================================
+    - name: Refresh Subscription
+      continue-on-error: true
+      env:
+        YOUR_ID: ${{ secrets.SERVER_YOUR_ID }}
+        CUR_PWD: ${{ secrets.SERVER_CUR_PWD }}
+        SERVER_SHORT_ID: ${{ secrets.SERVER_SHORT_ID }}
+        XRAY_PATH: ${{ github.workspace }}/xray-linux-amd64
+        CHROME_PATH: /usr/bin/google-chrome
+      run: |
+        chmod +x xray-linux-amd64 || true
+        node fetch_subscription.js
+
+    - name: Commit Updated Subscription
+      if: always()
+      continue-on-error: true
+      run: |
+        git config user.name  "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git add clash.yaml sub.txt node-info.json
+        if git diff --staged --quiet; then
+          echo "订阅无变化，无需提交"
+        else
+          git commit -m "chore: refresh subscription ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
+          git push
+          echo "订阅已更新并推送"
+        fi
 
     - name: Upload Screenshots
       if: always()
