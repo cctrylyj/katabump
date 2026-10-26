@@ -1,0 +1,395 @@
+/**
+ * KataBump 自动启动器
+ * ====================
+ * 用途：登录面板，把处于 offline 状态的服务器点 Start 拉起来。
+ *
+ * 为什么需要它：
+ *   - 免费容器每 4 天到期，续期后服务器是 offline 状态，需要手动点 Start
+ *   - 平台维护 / 宿主机重启后，容器不会自己起来
+ *   - 有了它，配合续期 workflow 就是「续期 + 开机」全自动
+ *
+ * 行为：
+ *   1. 登录 dashboard.katabump.com（复用 Turnstile CDP 绕过）
+ *   2. 进入服务器详情页
+ *   3. 找 Start / Power / 启动 按钮并点击
+ *   4. 等待服务器状态变成 running / online
+ *   5. 截图 + Telegram 通知
+ *
+ * 环境变量：
+ *   USERS_JSON      必填，格式 [{"username":"xxx","password":"xxx"}]
+ *   TG_BOT_TOKEN    可选
+ *   TG_CHAT_ID      可选
+ *   HTTP_PROXY      可选
+ *   CHROME_PATH     可选，默认 /usr/bin/google-chrome
+ *   DRY_RUN=1       只看状态不点击（调试用）
+ */
+const { chromium } = require('playwright-extra');
+const stealth = require('puppeteer-extra-plugin-stealth')();
+const axios = require('axios');
+const fs = require('fs');
+const path = require('path');
+const { spawn, exec } = require('child_process');
+
+const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN;
+const TG_CHAT_ID = process.env.TG_CHAT_ID;
+const CHROME_PATH = process.env.CHROME_PATH || '/usr/bin/google-chrome';
+const DEBUG_PORT = 9222;
+const DRY_RUN = process.env.DRY_RUN === '1';
+
+chromium.use(stealth);
+process.env.NO_PROXY = 'localhost,127.0.0.1';
+
+// --- 代理配置 ---
+const HTTP_PROXY = process.env.HTTP_PROXY;
+let PROXY_CONFIG = null;
+if (HTTP_PROXY) {
+    try {
+        const proxyUrl = new URL(HTTP_PROXY);
+        PROXY_CONFIG = {
+            server: `${proxyUrl.protocol}//${proxyUrl.hostname}:${proxyUrl.port}`,
+            username: proxyUrl.username ? decodeURIComponent(proxyUrl.username) : null,
+            password: proxyUrl.password ? decodeURIComponent(proxyUrl.password) : null,
+        };
+        console.log(`[代理] 检测到配置: 服务器=${PROXY_CONFIG.server}, 认证=${PROXY_CONFIG.username ? '是' : '否'}`);
+    } catch (e) {
+        console.error('[代理] 配置解析失败:', e.message);
+    }
+}
+
+async function sendTelegram(message, imagePath = null) {
+    if (!TG_BOT_TOKEN || !TG_CHAT_ID) return;
+    try {
+        await axios.post(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`, {
+            chat_id: TG_CHAT_ID, text: message, parse_mode: 'Markdown',
+        });
+        console.log('[Telegram] Message sent.');
+    } catch (e) {
+        console.error('[Telegram] Failed to send message:', e.message);
+    }
+    if (imagePath && fs.existsSync(imagePath)) {
+        const cmd = `curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendPhoto" -F chat_id="${TG_CHAT_ID}" -F photo="@${imagePath}"`;
+        await new Promise((resolve) => {
+            exec(cmd, (err) => {
+                if (err) console.error('[Telegram] Failed to send photo:', err.message);
+                else console.log('[Telegram] Photo sent.');
+                resolve();
+            });
+        });
+    }
+}
+
+// --- Turnstile CDP 绕过（与 action_renew.js 同一套逻辑）---
+const INJECTED_SCRIPT = `
+(function() {
+  const origFetch = window.fetch;
+  window.fetch = function(...args) {
+    const req = args[0];
+    const url = typeof req === 'string' ? req : (req && req.url) || '';
+    if (url.includes('/api/v1/user/turnstile')) {
+      console.log('>>> Turnstile API called');
+      const headers = (req && req.headers) || {};
+      console.log('>>> Headers: ' + JSON.stringify(headers));
+    }
+    return origFetch.apply(this, args);
+  };
+})();
+`;
+
+async function attemptTurnstileCdp(page) {
+    try {
+        const client = await page.context().newCDPSession(page);
+        await client.send('Page.enable');
+        await client.send('Runtime.enable');
+
+        let found = false;
+        for (const frame of page.frames()) {
+            if (!frame.url().includes('challenges.cloudflare.com')) continue;
+            found = true;
+            const box = await frame.locator('body').boundingBox().catch(() => null);
+            if (!box) continue;
+            const x = box.x + box.width / 2;
+            const y = box.y + 30;
+            await client.send('Input.dispatchMouseEvent', {
+                type: 'mousePressed', x, y, button: 'left', clickCount: 1,
+            });
+            await client.send('Input.dispatchMouseEvent', {
+                type: 'mouseReleased', x, y, button: 'left', clickCount: 1,
+            });
+        }
+        return found;
+    } catch (e) {
+        return false;
+    }
+}
+
+async function isTurnstilePassed(page) {
+    for (const f of page.frames()) {
+        if (f.url().includes('cloudflare')) {
+            try {
+                if (await f.getByText('Success!', { exact: false }).isVisible({ timeout: 500 })) return true;
+            } catch (e) { /* ignore */ }
+        }
+    }
+    return false;
+}
+
+/** 读取页面上服务器状态文本 */
+async function readServerStatus(page) {
+    const body = await page.locator('body').innerText().catch(() => '');
+    const lower = body.toLowerCase();
+    if (/\boffline\b|stopped|已停止|已离线/.test(lower)) return 'offline';
+    if (/\brunning\b|online|运行中|在线/.test(lower)) return 'running';
+    if (/\bstarting\b|starting up|启动中/.test(lower)) return 'starting';
+    if (/\bcrashed\b|崩溃/.test(lower)) return 'crashed';
+    return 'unknown';
+}
+
+/** 找并点击启动按钮 */
+async function clickStart(page) {
+    const candidates = [
+        page.getByRole('button', { name: 'Start', exact: true }),
+        page.getByRole('button', { name: /start/i }),
+        page.getByRole('button', { name: 'Power', exact: true }),
+        page.getByRole('button', { name: 'Power On', exact: true }),
+        page.getByRole('link', { name: /start/i }),
+        page.getByText(/^start$/i),
+    ];
+    for (const c of candidates) {
+        try {
+            await c.first().waitFor({ state: 'visible', timeout: 2500 });
+            const visible = await c.first().isVisible();
+            if (visible) {
+                console.log('   >> 找到启动按钮，点击中...');
+                await c.first().click();
+                return true;
+            }
+        } catch (e) { /* try next */ }
+    }
+    return false;
+}
+
+(async () => {
+    const usersRaw = process.env.USERS_JSON;
+    if (!usersRaw) {
+        console.error('未在 process.env.USERS_JSON 中找到用户');
+        process.exit(1);
+    }
+    let users;
+    try {
+        users = JSON.parse(usersRaw);
+    } catch (e) {
+        console.error('USERS_JSON 解析失败:', e.message);
+        process.exit(1);
+    }
+    if (!Array.isArray(users) || !users.length) {
+        console.error('USERS_JSON 为空');
+        process.exit(1);
+    }
+
+    // 启动 Chrome（带调试端口，方便 CDP 点击）
+    console.log('检查 Chrome 是否已在端口 ' + DEBUG_PORT + ' 上运行...');
+    let chromeRunning = false;
+    try {
+        await new Promise((resolve, reject) => {
+            const req = http.get(`http://127.0.0.1:${DEBUG_PORT}/json/version`, (res) => {
+                res.resume();
+                resolve();
+            });
+            req.on('error', reject);
+            req.setTimeout(2000, () => req.destroy(new Error('timeout')));
+        });
+        chromeRunning = true;
+    } catch (e) { /* not running */ }
+
+    if (!chromeRunning) {
+        console.log(`正在启动 Chrome (路径: ${CHROME_PATH})...`);
+        const chromeArgs = [
+            '--remote-debugging-port=' + DEBUG_PORT,
+            '--no-sandbox', '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--window-size=1920,1080',
+            '--user-data-dir=/tmp/chrome-katabump-profile',
+            'about:blank',
+        ];
+        const proxyArgs = PROXY_CONFIG
+            ? [`--proxy-server=${PROXY_CONFIG.server}`]
+            : [];
+        const child = spawn(CHROME_PATH, [...proxyArgs, ...chromeArgs], {
+            stdio: 'ignore', detached: true,
+        });
+        child.unref();
+        for (let i = 0; i < 30; i++) {
+            await new Promise((r) => setTimeout(r, 1000));
+            try {
+                await new Promise((resolve, reject) => {
+                    const req = http.get(`http://127.0.0.1:${DEBUG_PORT}/json/version`, (res) => {
+                        res.resume(); resolve();
+                    });
+                    req.on('error', reject);
+                    req.setTimeout(2000, () => req.destroy(new Error('timeout')));
+                });
+                chromeRunning = true;
+                break;
+            } catch (e) { /* retry */ }
+        }
+        if (!chromeRunning) {
+            console.error('Chrome 无法在端口 ' + DEBUG_PORT + ' 上启动');
+            process.exit(1);
+        }
+    }
+    console.log('Chrome 已就绪。');
+
+    const browser = await chromium.connectOverCDP(`http://127.0.0.1:${DEBUG_PORT}`);
+    const context = browser.contexts()[0] || (await browser.newContext());
+    let page = context.pages()[0] || (await context.newPage());
+    await page.addInitScript(INJECTED_SCRIPT);
+
+    if (PROXY_CONFIG && PROXY_CONFIG.username) {
+        await context.setExtraHTTPHeaders({ 'Proxy-Authorization': 'Basic ' + Buffer.from(`${PROXY_CONFIG.username}:${PROXY_CONFIG.password}`).toString('base64') });
+    }
+
+    const photoDir = path.join(process.cwd(), 'screenshots');
+    if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
+
+    let anyStarted = false;
+
+    for (let i = 0; i < users.length; i++) {
+        const user = users[i];
+        console.log(`\n=== 正在处理用户 ${i + 1}/${users.length} ===`);
+        const safeUser = (user.username || 'user').replace(/[^a-z0-9]/gi, '_');
+
+        try {
+            if (page.isClosed()) {
+                page = await context.newPage();
+                await page.addInitScript(INJECTED_SCRIPT);
+            }
+
+            // --- 登录 ---
+            if (page.url().includes('dashboard')) {
+                await page.goto('https://dashboard.katabump.com/auth/logout');
+                await page.waitForTimeout(2000);
+            }
+            await page.goto('https://dashboard.katabump.com/auth/login');
+            await page.waitForTimeout(2000);
+            if (page.url().includes('dashboard')) {
+                await page.goto('https://dashboard.katabump.com/auth/logout');
+                await page.waitForTimeout(2000);
+                await page.goto('https://dashboard.katabump.com/auth/login');
+                await page.waitForTimeout(1500);
+            }
+
+            console.log('正在输入凭据...');
+            try {
+                const emailInput = page.getByRole('textbox', { name: 'Email' });
+                await emailInput.waitFor({ state: 'visible', timeout: 5000 });
+                await emailInput.fill(user.username);
+                const pwdInput = page.getByRole('textbox', { name: 'Password' });
+                await pwdInput.fill(user.password);
+                await page.waitForTimeout(500);
+
+                // 登录前 Turnstile
+                let cdpClickResult = false;
+                for (let a = 0; a < 15; a++) {
+                    cdpClickResult = await attemptTurnstileCdp(page);
+                    if (cdpClickResult) break;
+                    await page.waitForTimeout(1000);
+                }
+                if (cdpClickResult) {
+                    console.log('   >> 登录前 Turnstile 已点击，等待成功标志...');
+                    for (let s = 0; s < 10; s++) {
+                        if (await isTurnstilePassed(page)) {
+                            console.log('   >> 登录前 Turnstile 验证成功。');
+                            break;
+                        }
+                        await page.waitForTimeout(1000);
+                    }
+                }
+
+                await page.getByRole('button', { name: 'Login', exact: true }).click();
+                await page.waitForTimeout(3000);
+
+                try {
+                    const errMsg = page.getByText('Incorrect password or no account');
+                    if (await errMsg.isVisible({ timeout: 3000 })) {
+                        console.error('   >> ❌ 登录失败: 账号或密码错误');
+                        await sendTelegram(`❌ *自动启动失败*\n用户: ${user.username}\n原因: 账号或密码错误`);
+                        continue;
+                    }
+                } catch (e) { /* ignore */ }
+            } catch (e) {
+                console.log('登录错误:', e.message);
+            }
+
+            // --- 进入服务器页 ---
+            console.log('正在寻找 "See" 链接...');
+            try {
+                await page.getByRole('link', { name: 'See' }).first().waitFor({ timeout: 15000 });
+                await page.waitForTimeout(1000);
+                await page.getByRole('link', { name: 'See' }).first().click();
+                await page.waitForTimeout(3000);
+            } catch (e) {
+                console.log('未找到 "See" 按钮。');
+                await sendTelegram(`⚠️ *自动启动跳过*\n用户: ${user.username}\n原因: 未找到服务器入口`);
+                continue;
+            }
+
+            // --- 读状态 ---
+            let status = await readServerStatus(page);
+            console.log('   >> 当前状态:', status);
+
+            if (status === 'running') {
+                console.log('   >> ✅ 服务器已在运行，无需启动。');
+                const shotPath = path.join(photoDir, `${safeUser}_already_running.png`);
+                try { await page.screenshot({ path: shotPath, fullPage: true }); } catch (e) { /* ignore */ }
+                await sendTelegram(`ℹ️ *服务器已在运行*\n用户: ${user.username}\n无需启动`, shotPath);
+                continue;
+            }
+
+            if (DRY_RUN) {
+                console.log('   >> DRY_RUN，跳过点击。');
+                continue;
+            }
+
+            // --- 点 Start ---
+            const clicked = await clickStart(page);
+            if (!clicked) {
+                console.log('   >> ❌ 未找到启动按钮。');
+                const shotPath = path.join(photoDir, `${safeUser}_no_start_btn.png`);
+                try { await page.screenshot({ path: shotPath, fullPage: true }); } catch (e) { /* ignore */ }
+                await sendTelegram(`⚠️ *自动启动未找到按钮*\n用户: ${user.username}\n状态: ${status}`, shotPath);
+                continue;
+            }
+
+            // --- 等待变为 running ---
+            let finalStatus = status;
+            for (let w = 0; w < 24; w++) {
+                await page.waitForTimeout(5000);
+                try {
+                    await page.reload({ waitUntil: 'domcontentloaded' });
+                    await page.waitForTimeout(2000);
+                } catch (e) { /* ignore */ }
+                finalStatus = await readServerStatus(page);
+                console.log(`   >> 等待中... 状态: ${finalStatus}`);
+                if (finalStatus === 'running') break;
+            }
+
+            const shotPath = path.join(photoDir, `${safeUser}_start_${finalStatus}.png`);
+            try { await page.screenshot({ path: shotPath, fullPage: true }); } catch (e) { /* ignore */ }
+
+            if (finalStatus === 'running') {
+                anyStarted = true;
+                console.log('   >> ✅ 启动成功！');
+                await sendTelegram(`✅ *自动启动成功*\n用户: ${user.username}\n服务器已上线`, shotPath);
+            } else {
+                console.log(`   >> ⚠️ 点击后状态仍为 ${finalStatus}`);
+                await sendTelegram(`⚠️ *自动启动未确认*\n用户: ${user.username}\n状态: ${finalStatus}`, shotPath);
+            }
+        } catch (err) {
+            console.error('处理用户时出错:', err);
+        }
+    }
+
+    console.log('\n完成。');
+    await browser.close();
+    process.exit(anyStarted || !DRY_RUN ? 0 : 0);
+})();
