@@ -272,49 +272,74 @@ async function readServerStatus(page) {
  * @returns {{identifier:string, password:string}}
  */
 async function readServerCredentials(page) {
-    const creds = { identifier: '', password: '' };
+    const creds = { identifier: '', password: '', link: '' };
     try {
         const found = await page.evaluate(() => {
-            const out = { identifier: '', password: '' };
-            // 策略：按 "label 文本 -> 相邻元素的值" 配对
-            const labels = Array.from(document.querySelectorAll(
-                'label,span,div,p,td,th,h6,h5,h4'));
-            for (const lab of labels) {
-                const t = (lab.textContent || '').trim().toLowerCase();
-                if (!t || t.length > 40) continue;
+            const out = { identifier: '', password: '', link: '' };
 
-                // 找紧邻的下一个可读值的元素
-                const grab = (el) => {
-                    if (!el) return '';
-                    const v = (el.value || el.textContent || '').trim();
-                    return v && v.length <= 64 ? v : '';
-                };
-                let val = '';
-                // 同一个容器里的兄弟节点
-                const parent = lab.parentElement;
-                if (parent) {
-                    const sibs = Array.from(parent.children).filter((c) => c !== lab);
-                    for (const s of sibs) {
-                        val = grab(s);
-                        if (val) break;
-                    }
-                }
-                if (!val) val = grab(lab.nextElementSibling);
-                if (!val) {
-                    // 再试：父容器里除 label 外的其它文本
-                    const p2 = lab.parentElement && lab.parentElement.parentElement;
-                    if (p2) {
-                        const txt = (p2.innerText || '').split('\n').map(s => s.trim()).filter(Boolean);
-                        const idx = txt.findIndex(s => s.toLowerCase() === t);
-                        if (idx >= 0 && txt[idx + 1]) val = txt[idx + 1];
-                    }
-                }
+            // --- 策略 1：收集所有 input 的 value ---
+            // 值域在页面上是灰底可编辑样式，很可能是 <input readonly> 或 code
+            const inputVals = Array.from(document.querySelectorAll('input'))
+                .map((el) => ({
+                    v: (el.value || '').trim(),
+                    // 用 label/aria-label/title 猜它是什么字段
+                    hint: ((el.getAttribute('aria-label') || '') + ' ' +
+                           (el.name || '') + ' ' + (el.id || '') + ' ' +
+                           (el.placeholder || '')).toLowerCase(),
+                }))
+                .filter((x) => x.v);
+
+            const pickByHint = (re) => {
+                for (const x of inputVals) if (re.test(x.hint)) return x.v;
+                return '';
+            };
+            out.password = pickByHint(/pass|secret|token/i);
+            out.identifier = pickByHint(/ident|id(?!ent)|uuid|server/i);
+
+            // --- 策略 2：按可见行文本配对 "标签 -> 值" ---
+            // 页面上每个字段占一行，形如：
+            //   Link
+            //   https://control.katabump.com/server/77f51fce
+            const lines = (document.body.innerText || '')
+                .split('\n')
+                .map((s) => s.trim())
+                .filter(Boolean);
+
+            const labelOf = (i) => lines[i].toLowerCase().replace(/[:：]$/, '');
+            const valueAt = (i) => {
+                const v = lines[i];
+                if (!v) return '';
+                // 值不能是另一个已知标签
+                if (/^(link|identifier|current password|password|username|email)$/i.test(v)) return '';
+                return v;
+            };
+
+            for (let i = 0; i < lines.length - 1; i++) {
+                const lab = labelOf(i);
+                const val = valueAt(i + 1);
                 if (!val) continue;
 
-                if (/current password|^password$/.test(t)) out.password = val;
-                else if (/^identifier$/.test(t)) out.identifier = val;
-                else if (/^link$/.test(t)) out.link = val;
+                if (lab === 'current password' || lab === 'password') {
+                    if (!out.password) out.password = val;
+                } else if (lab === 'identifier') {
+                    if (!out.identifier) out.identifier = val;
+                } else if (lab === 'link') {
+                    if (!out.link) out.link = val;
+                }
             }
+
+            // --- 策略 3：从任意位置抓 control.katabump.com 的 URL ---
+            if (!out.link) {
+                const m = (document.body.innerText || '')
+                    .match(/https:\/\/control\.katabump\.com\/[^\s"'<>]+/);
+                if (m) out.link = m[0];
+            }
+            // --- 策略 4：从 Identifier 推 Link（路径尾段是 identifier）---
+            if (!out.link && out.identifier) {
+                // Link 的路径尾段和 Identifier 不同（77f51fce vs c1771abb34b6161），
+                // 所以这里不做推算，保持为空
+            }
+
             return out;
         });
         creds.identifier = found.identifier || '';
@@ -347,20 +372,23 @@ async function gotoControlPanel(page) {
         }
     } catch (e) { /* 试下一招 */ }
 
-    // 方案 2：从页面上任何地方提取 control.katabump.com 的 URL
+    // 方案 2：优先用已经读到的 Link；否则从页面上任何地方提取 control.katabump.com 的 URL
     try {
-        const link = await page.evaluate(() => {
-            const all = Array.from(document.querySelectorAll('*'));
-            for (const el of all) {
-                const vals = [el.value, el.textContent, el.href, el.getAttribute('href')]
-                    .filter(v => typeof v === 'string');
-                for (const v of vals) {
-                    const m = v.match(/https:\/\/control\.katabump\.com\/[^\s"'<>]+/);
-                    if (m) return m[0];
+        let link = SERVER_CREDENTIALS.link || '';
+        if (!link) {
+            link = await page.evaluate(() => {
+                const all = Array.from(document.querySelectorAll('*'));
+                for (const el of all) {
+                    const vals = [el.value, el.textContent, el.href, el.getAttribute('href')]
+                        .filter(v => typeof v === 'string');
+                    for (const v of vals) {
+                        const m = v.match(/https:\/\/control\.katabump\.com\/[^\s"'<>]+/);
+                        if (m) return m[0];
+                    }
                 }
-            }
-            return '';
-        });
+                return '';
+            });
+        }
         if (link) {
             console.log('   >> 控制面板地址:', link);
             await page.goto(link, { waitUntil: 'domcontentloaded', timeout: 30000 });
@@ -408,15 +436,32 @@ async function ensureControlLogin(page) {
             (/\bpassword\b/i.test(body) && !/start|stop|power/i.test(body));
         if (!needsLogin) return true;
 
-        // ⚠️ 控制面板优先用服务器的 "Current password"，
-        //    账号密码在这里登录会失败（实测就是卡在这一步）。
-        const pwd = SERVER_CREDENTIALS.password || CURRENT_USER.password;
-        const idt = SERVER_CREDENTIALS.identifier || CURRENT_USER.username;
-        console.log('   >> 控制面板需要登录' +
-            (SERVER_CREDENTIALS.password ? '（使用服务器 Current password）' : '（使用账号密码）'));
+        console.log('   >> 控制面板需要登录');
 
-        // 用户名定位器
-        const emailCandidates = [
+        // --- 组装候选凭据组合 ---
+        // 控制面板（control.katabump.com）用的是服务器专属凭据：
+        //   Your ID  = Identifier（Access server 标签页）或者 Link 路径尾段
+        //   Password = Current password（Access server 标签页）
+        // 但也不排除平台改版成用账号密码，所以把各种组合都试一遍。
+        const ids = [];
+        const push = (v) => { if (v && !ids.includes(v)) ids.push(v); };
+        push(SERVER_CREDENTIALS.identifier);
+        // Link 路径尾段（如 /server/77f51fce -> 77f51fce）
+        if (SERVER_CREDENTIALS.link) {
+            const m = SERVER_CREDENTIALS.link.match(/\/server\/([^/?#]+)/);
+            if (m) push(m[1]);
+        }
+        push(CURRENT_USER.username);
+
+        const pwds = [];
+        const pushP = (v) => { if (v && !pwds.includes(v)) pwds.push(v); };
+        pushP(SERVER_CREDENTIALS.password);
+        pushP(CURRENT_USER.password);
+
+        console.log('   >> 候选 ID:', ids.length, '个；候选密码:', pwds.length, '个');
+
+        // --- 定位器 ---
+        const userLocators = [
             page.getByRole('textbox', { name: 'Email' }),
             page.getByRole('textbox', { name: /email/i }),
             page.getByRole('textbox', { name: /your id/i }),
@@ -425,94 +470,84 @@ async function ensureControlLogin(page) {
             page.locator('input[name*="email" i]'),
             page.locator('input[name*="user" i]'),
             page.locator('input[name*="id" i]'),
+            page.locator('form input:not([type="password"])'),
         ];
-        let filled = false;
-        for (const c of emailCandidates) {
-            try {
-                await c.first().waitFor({ state: 'visible', timeout: 2000 });
-                await c.first().fill(idt);
-                filled = true;
-                break;
-            } catch (e) { /* try next */ }
-        }
-        if (!filled) {
-            const inputs = await page.$$('input');
-            if (inputs.length >= 2) {
-                await inputs[0].click({ clickCount: 3 });
-                await inputs[0].type(idt);
-                filled = true;
-            }
-        }
-        if (!filled) throw new Error('找不到用户名输入框');
-
-        // 密码定位器
-        const pwdCandidates = [
+        const pwdLocators = [
             page.getByRole('textbox', { name: 'Password' }),
             page.getByRole('textbox', { name: /password/i }),
             page.locator('input[type="password"]'),
         ];
-        let pwdFilled = false;
-        for (const c of pwdCandidates) {
-            try {
-                await c.first().waitFor({ state: 'visible', timeout: 2000 });
-                await c.first().fill(pwd);
-                pwdFilled = true;
-                break;
-            } catch (e) { /* try next */ }
-        }
-        if (!pwdFilled) {
-            const inputs = await page.$$('input[type="password"]');
-            if (inputs.length) {
-                await inputs[0].click({ clickCount: 3 });
-                await inputs[0].type(pwd);
-                pwdFilled = true;
-            }
-        }
-        if (!pwdFilled) throw new Error('找不到密码输入框');
-
-        await page.waitForTimeout(500);
-        for (let a = 0; a < 12; a++) {
-            if (await attemptTurnstileCdp(page)) break;
-            await page.waitForTimeout(1000);
-        }
-        // 登录按钮文案可能是 Login / Sign in / Log in
-        const loginBtns = [
+        const loginLocators = [
             page.getByRole('button', { name: 'Login', exact: true }),
             page.getByRole('button', { name: /log\s*in/i }),
             page.getByRole('button', { name: /sign\s*in/i }),
             page.locator('input[type="submit"]'),
         ];
-        let clicked = false;
-        for (const b of loginBtns) {
-            try {
-                await b.first().waitFor({ state: 'visible', timeout: 2500 });
-                await b.first().click();
-                clicked = true;
-                break;
-            } catch (e) { /* try next */ }
-        }
-        if (!clicked) throw new Error('找不到登录按钮');
 
-        await page.waitForTimeout(5000);
-        const afterUrl = page.url();
-        if (/login|sign ?in/i.test(afterUrl)) {
-            console.log('   >> ❌ 控制面板登录被拒绝，仍停在登录页');
-            // 试另一种密码：账号密码
-            if (SERVER_CREDENTIALS.password && CURRENT_USER.password) {
-                console.log('   >> 改用账号密码重试一次...');
+        const fillFirst = async (locators, value) => {
+            for (const c of locators) {
                 try {
-                    const p = await page.$('input[type="password"]');
-                    if (p) {
-                        await p.click({ clickCount: 3 });
-                        await p.type(CURRENT_USER.password);
-                        const lb = await page.$('button[type="submit"],input[type="submit"],button');
-                        if (lb) { await lb.click(); await page.waitForTimeout(5000); }
-                    }
-                } catch (e) { /* ignore */ }
+                    await c.first().waitFor({ state: 'visible', timeout: 2000 });
+                    await c.first().fill(value);
+                    return true;
+                } catch (e) { /* try next */ }
             }
+            return false;
+        };
+
+        let loggedIn = false;
+        for (const id of ids) {
+            if (!id) continue;
+            for (const pwd of pwds) {
+                if (!pwd) continue;
+                console.log('   >> 尝试登录: ID=' + id.slice(0, 8) + '… 密码=' +
+                    (pwd === SERVER_CREDENTIALS.password ? '服务器密码' : '账号密码'));
+
+                const userOk = await fillFirst(userLocators, id);
+                const pwdOk = await fillFirst(pwdLocators, pwd);
+                if (!userOk || !pwdOk) {
+                    console.log('   >> 表单定位失败，跳过这组');
+                    continue;
+                }
+
+                await page.waitForTimeout(400);
+                // Turnstile
+                for (let a = 0; a < 10; a++) {
+                    if (await attemptTurnstileCdp(page)) break;
+                    await page.waitForTimeout(1000);
+                }
+                // 点登录
+                for (const b of loginLocators) {
+                    try {
+                        await b.first().waitFor({ state: 'visible', timeout: 2500 });
+                        await b.first().click();
+                        break;
+                    } catch (e) { /* try next */ }
+                }
+                await page.waitForTimeout(4500);
+
+                const afterUrl = page.url();
+                const afterBody = await page.locator('body').innerText().catch(() => '');
+                const ok = !/login|sign ?in/i.test(afterUrl) &&
+                    !/^\s*login\s*$/i.test(afterBody.slice(0, 200));
+                if (ok) {
+                    console.log('   >> ✅ 登录成功，当前地址:', afterUrl);
+                    loggedIn = true;
+                    break;
+                }
+                console.log('   >> ❌ 这组凭据被拒绝');
+            }
+            if (loggedIn) break;
         }
-        console.log('   >> 控制面板登录完成，当前地址:', page.url());
-        return true;
+
+        if (!loggedIn) {
+            console.log('   >> ❌ 所有凭据组合都失败了');
+            try {
+                const b = await page.locator('body').innerText().catch(() => '');
+                console.log('   >> 控制面板页面文本:', b.replace(/\s+/g, ' ').slice(0, 400));
+            } catch (e2) { /* ignore */ }
+        }
+        return loggedIn;
     } catch (e) {
         console.log('   >> 控制面板登录处理异常:', e.message);
         try {
