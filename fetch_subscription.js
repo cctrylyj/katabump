@@ -530,15 +530,22 @@ ipv6: false
 external-controller: 127.0.0.1:9090
 unified-delay: true
 tcp-concurrent: true
-# 关闭 Nagle 算法。
-# 节点在法国 OVH，国内过去 RTT ≈ 239ms —— 高延迟下 Nagle 会把小包攒着一起发，
+# 关闭 Nagle 算法（保留，默认开着；关掉没有副作用）。
+# 起因：节点在法国 OVH，国内过去 RTT ≈ 269ms，高延迟下 Nagle 会把小包攒着一起发，
 # 导致「请求发出去了但迟迟不回」，体感就是「卡」。
-# 2026-10-26 实测（7 次取中位数，每次 8MB）：
-#   基准（无优化）      234 KB/s
-#   tcp-no-delay        609 KB/s  (+160%)
-#   tcp-no-delay + 1MB  1031 KB/s (+340%)  ← 当前配置
-# 注意：不要开 tcp-fast-open —— 实测反而更慢（中位 123 KB/s），
-# TFO cookie 需要一次往返建立，239ms RTT 下收益为负。
+#
+# ⚠️ 关于效果的重要更正（2026-10-26 晚间）：
+# 初版注释写的「+160% / +340%」是单次采样的假象，不可复现。
+# 后续 4 组独立对照实验 + 各 3~7 次采样取中位，证明真正根因是
+# **这条跨境线路 11% 的丢包率**（ICMP 实测 100 包丢 11%，对照 8.8.8.8 只丢 3%），
+# TCP 拥塞窗口被反复腰斩，吞吐按 Mathis 公式塌陷到
+#     BW = MSS / (RTT × √p) = 1448 / (0.269 × √0.11) ≈ 16 KB/s
+# 与实测单流 20~50 KB/s 吻合。
+# tcp-no-delay / bufferSize / TFO / mptcp / tcpKeepAlive 全部实测无显著差异，
+# 但保留 tcp-no-delay 无害且符合直觉，继续开着。
+#
+# ⚠️ 不要开 tcp-fast-open：TFO cookie 需要一次往返建立，
+# 高 RTT 下收益为负，实测反而更慢。
 tcp-no-delay: true
 
 proxies:
