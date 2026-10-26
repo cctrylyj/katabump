@@ -212,11 +212,33 @@ async function switchToAccessServerTab(page) {
 
 /** 读取页面上服务器状态文本 */
 async function readServerStatus(page) {
-    // 优先看状态徽章 —— 面板上状态通常是个小圆点 + 文字，
-    // 直接看徽章比扫全页文本准得多（避免 "online" 之类的词出现在别处）
+    // --- 策略 1：找"内容恰好是状态词"的叶子元素 ---
+    // 实测控制面板首页的服务器卡片上就有一个绿标，文字是 "Online"，
+    // 离线时是 "Offline"。这个元素没有 badge/status 之类的 class，
+    // 所以不能靠 class 找，只能靠"文本正好等于状态词"来命中。
     try {
         const badge = await page.evaluate(() => {
-            // 找带 class 含 badge / status / pill / dot 的小元素
+            const WORD = /^(online|offline|running|stopped|starting|crashed|active|inactive|已停止|已离线|运行中|在线|启动中|崩溃)$/i;
+            const leaves = Array.from(document.querySelectorAll('body *'))
+                .filter((el) => el.children.length === 0);   // 只看叶子节点
+            for (const el of leaves) {
+                const t = (el.textContent || '').trim();
+                if (t && t.length < 24 && WORD.test(t)) return t;
+            }
+            return '';
+        });
+        if (badge) {
+            const b = badge.toLowerCase();
+            if (/offline|stopped|inactive|已停止|已离线/.test(b)) return 'offline';
+            if (/online|running|active|运行中|在线/.test(b)) return 'running';
+            if (/starting|启动中/.test(b)) return 'starting';
+            if (/crash|崩溃/.test(b)) return 'crashed';
+        }
+    } catch (e) { /* ignore */ }
+
+    // --- 策略 2：带 status/badge/pill 特征的徽章 ---
+    try {
+        const badge = await page.evaluate(() => {
             const els = Array.from(document.querySelectorAll(
                 '[class*="badge"],[class*="status"],[class*="pill"],[class*="dot"],[class*="indicator"]'));
             for (const el of els) {
@@ -234,11 +256,13 @@ async function readServerStatus(page) {
         }
     } catch (e) { /* ignore */ }
 
-    // 退回全页文本匹配
+    // --- 策略 3：全页文本匹配 ---
+    // ⚠️ offline 要先判，因为 "offline" 里不含 "online" 子串，但反过来
+    //    "not online" 会误判成 running，所以 offline 优先更安全。
     const body = await page.locator('body').innerText().catch(() => '');
     const lower = body.toLowerCase();
-    if (/\boffline\b|stopped|已停止|已离线/.test(lower)) return 'offline';
-    if (/\brunning\b|运行中/.test(lower)) return 'running';
+    if (/\boffline\b|\bstopped\b|已停止|已离线/.test(lower)) return 'offline';
+    if (/\bonline\b|\brunning\b|运行中|在线/.test(lower)) return 'running';
     if (/\bstarting\b|starting up|启动中/.test(lower)) return 'starting';
     if (/\bcrashed\b|崩溃/.test(lower)) return 'crashed';
     return 'unknown';
@@ -272,89 +296,80 @@ async function readServerStatus(page) {
  * @returns {{identifier:string, password:string}}
  */
 async function readServerCredentials(page) {
-    const creds = { identifier: '', password: '', link: '' };
+    const creds = { identifier: '', password: '', link: '', serverId: '', hexIds: [] };
     try {
         const found = await page.evaluate(() => {
-            const out = { identifier: '', password: '', link: '' };
+            const out = { identifier: '', password: '', link: '', serverId: '', hexIds: [] };
 
-            // --- 策略 1：收集所有 input 的 value ---
-            // 值域在页面上是灰底可编辑样式，很可能是 <input readonly> 或 code
-            const inputVals = Array.from(document.querySelectorAll('input'))
-                .map((el) => ({
-                    v: (el.value || '').trim(),
-                    // 用 label/aria-label/title 猜它是什么字段
-                    hint: ((el.getAttribute('aria-label') || '') + ' ' +
-                           (el.name || '') + ' ' + (el.id || '') + ' ' +
-                           (el.placeholder || '')).toLowerCase(),
-                }))
-                .filter((x) => x.v);
+            const inputs = Array.from(document.querySelectorAll('input'));
+            const valOf = (el) => (el.value || '').trim();
+            const nameOf = (el) => (el.name || '').toLowerCase();
+            const idOf = (el) => (el.id || '').toLowerCase();
 
-            const pickByHint = (re) => {
-                for (const x of inputVals) if (re.test(x.hint)) return x.v;
-                return '';
+            // 无意义的值（不是我们要的凭据）
+            const isJunk = (el, v) => {
+                if (!v) return true;
+                const h = nameOf(el) + ' ' + idOf(el);
+                if (/csrf|csrf|token/.test(h)) return true;       // csrf 表单域
+                if (/^[0-9a-f]{40,}$/i.test(v)) return true;      // csrf token 本体
+                if (/^\d+$/.test(v)) return true;                  // 内部数字 id（406255）
+                if (/^https?:\/\//i.test(v)) return true;          // URL
+                return false;
             };
-            out.password = pickByHint(/pass|secret|token/i);
-            out.identifier = pickByHint(/ident|id(?!ent)|uuid|server/i);
+            const isPwdField = (el) => /pass|secret/.test(nameOf(el) + ' ' + idOf(el));
 
-            // --- 策略 2：按可见行文本配对 "标签 -> 值" ---
-            // 页面上每个字段占一行，形如：
-            //   Link
-            //   https://control.katabump.com/server/77f51fce
-            const lines = (document.body.innerText || '')
-                .split('\n')
-                .map((s) => s.trim())
-                .filter(Boolean);
-
-            const labelOf = (i) => lines[i].toLowerCase().replace(/[:：]$/, '');
-            const valueAt = (i) => {
-                const v = lines[i];
-                if (!v) return '';
-                // 值不能是另一个已知标签
-                if (/^(link|identifier|current password|password|username|email)$/i.test(v)) return '';
-                return v;
-            };
-
-            for (let i = 0; i < lines.length - 1; i++) {
-                const lab = labelOf(i);
-                const val = valueAt(i + 1);
-                if (!val) continue;
-
-                if (lab === 'current password' || lab === 'password') {
-                    if (!out.password) out.password = val;
-                } else if (lab === 'identifier') {
-                    if (!out.identifier) out.identifier = val;
-                } else if (lab === 'link') {
-                    if (!out.link) out.link = val;
-                }
-            }
-
-            // --- 策略 3：从 input 的 value 或全文里抓 control.katabump.com 的 URL ---
-            // ⚠️ 注意：input 的 value **不会**出现在 innerText 里，
-            //    所以必须单独扫 input.value（实测就是这样漏掉的）
-            if (!out.link) {
-                for (const x of inputVals) {
-                    const m = x.v.match(/https:\/\/control\.katabump\.com\/[^\s"'<>]+/);
-                    if (m) { out.link = m[0]; break; }
-                }
+            // --- 1) Link：值里含 control.katabump.com 的 URL ---
+            // ⚠️ input 的 value **不会**出现在 innerText 里，必须单独扫 input.value
+            let linkEl = null;
+            for (const el of inputs) {
+                const m = valOf(el).match(/https:\/\/control\.katabump\.com\/[^\s"'<>]+/);
+                if (m) { out.link = m[0]; linkEl = el; break; }
             }
             if (!out.link) {
                 const m = (document.body.innerText || '')
                     .match(/https:\/\/control\.katabump\.com\/[^\s"'<>]+/);
                 if (m) out.link = m[0];
             }
-            // --- 策略 4：Link 路径尾段就是真实的服务器 ID（Your ID）---
-            // Pterodactyl 控制面板的 Your ID = /server/<id> 里的 <id>
+
+            // --- 2) Current password：name/id 含 pass 的 input ---
+            for (const el of inputs) {
+                if (isPwdField(el) && valOf(el)) { out.password = valOf(el); break; }
+            }
+
+            // --- 3) Identifier：Link 输入框**后面紧跟**的那个合法值 ---
+            //     实测 DOM 顺序：
+            //       #13 [类型 NodeJs] #14 [Link] #15 [Identifier] #16 [Current password] #17 [csrf]
+            //     ⚠️ 不能用 name 猜！name=serverid 的 input 值是内部数字 406255，不是登录 ID。
+            if (linkEl) {
+                const i = inputs.indexOf(linkEl);
+                for (let j = i + 1; j < inputs.length; j++) {
+                    const el = inputs[j];
+                    const v = valOf(el);
+                    if (isJunk(el, v)) continue;
+                    if (isPwdField(el)) continue;
+                    out.identifier = v;
+                    break;
+                }
+            }
+
+            // --- 4) 兜底：所有"像 ID"的十六进制串（排除密码 / csrf / URL / 纯数字）---
+            const cands = [];
+            for (const el of inputs) {
+                const v = valOf(el);
+                if (isJunk(el, v)) continue;
+                if (isPwdField(el)) continue;
+                if (v === out.password) continue;
+                if (/^[0-9a-f]{6,32}$/i.test(v)) cands.push(v);
+            }
+            out.hexIds = cands;
+            if (!out.identifier && cands.length) out.identifier = cands[0];
+
+            // --- 5) serverId：Link 路径尾段（注意它跟 Identifier 不是同一个东西）---
+            //     实测：Link = .../server/77f51fce，但真正能登录的 Your ID = c1771abb34b6161
             if (out.link) {
                 const m = out.link.match(/\/server\/([^/?#]+)/);
                 if (m) out.serverId = m[1];
             }
-
-            // --- 策略 5：兜底 —— 所有看起来像十六进制 ID 的 input 值都当候选 ---
-            // 页面上 General 页的 Identifier 也是 input value（灰底），
-            // 不一定带 aria-label，hint 策略抓不到。
-            out.hexIds = inputVals
-                .map((x) => x.v)
-                .filter((v) => /^[0-9a-f]{6,32}$/i.test(v));
 
             return out;
         });
@@ -446,7 +461,7 @@ async function ensureControlLogin(page) {
         const url = page.url();
         const body = await page.locator('body').innerText().catch(() => '');
         // 已经能看到 Start / Stop / Power，说明已登录，压根不需要这一步
-        if (/start server|power on|stop server|\bstart\b|\bstop\b|\bpower\b/i.test(body)) {
+        if (/start server|power on|stop server|power control|\bstart\b|\bstop\b|\bpower\b/i.test(body)) {
             console.log('   >> 控制面板已登录（能看到启动/停止控件）');
             return true;
         }
@@ -457,27 +472,24 @@ async function ensureControlLogin(page) {
         console.log('   >> 控制面板需要登录');
 
         // --- 组装候选凭据组合 ---
-        // 控制面板（control.katabump.com）用的是服务器专属凭据：
-        //   Your ID  = Identifier（Access server 标签页）或者 Link 路径尾段
-        //   Password = Current password（Access server 标签页）
-        // 但也不排除平台改版成用账号密码，所以把各种组合都试一遍。
+        // control.katabump.com 用的是服务器专属凭据：
+        //   Your ID  = Access server 标签页的 "Identifier"（实测 16 位，如 c1771abb34b6161）
+        //   Password = "Current password"（实测 12 位，如 9d1c8b0f884e）
+        //
+        // ⚠️ 血泪教训：Link 路径尾段（77f51fce）**不是**登录 ID，
+        //    name=serverid 的 input 值（406255）是内部数字 id，也不是。
+        //    只有页面上的 "Identifier" 字段值才对。
+        //    之前顺序搞反 → 试了 4 组全被拒（报 "No account matching those credentials"）。
         const ids = [];
         const push = (v) => { if (v && !ids.includes(v)) ids.push(v); };
-        // ⚠️ Your ID 优先用 Link 路径尾段（Pterodactyl 的 /server/<id>），
-        //    实测报 "No account matching those credentials" 就是因为用了 Identifier。
-        push(SERVER_CREDENTIALS.serverId);
-        if (SERVER_CREDENTIALS.link) {
-            const m = SERVER_CREDENTIALS.link.match(/\/server\/([^/?#]+)/);
-            if (m) push(m[1]);
-        }
-        push(SERVER_CREDENTIALS.identifier);
-        // 其它十六进制串也可能是 ID（General 页的 Identifier 就是 input value）
+        push(SERVER_CREDENTIALS.identifier);            // ← 真正的 Your ID，放第一
+        push(SERVER_CREDENTIALS.serverId);              // Link 尾段，备选
         for (const h of (SERVER_CREDENTIALS.hexIds || [])) push(h);
         push(CURRENT_USER.username);
 
         const pwds = [];
         const pushP = (v) => { if (v && !pwds.includes(v)) pwds.push(v); };
-        pushP(SERVER_CREDENTIALS.password);
+        pushP(SERVER_CREDENTIALS.password);   // Current password
         pushP(CURRENT_USER.password);
 
         console.log('   >> 候选 ID:', ids.length, '个；候选密码:', pwds.length, '个');
@@ -581,6 +593,50 @@ async function ensureControlLogin(page) {
 }
 
 /**
+ * 登录成功后，确保停在**服务器控制页**上。
+ *
+ * ⚠️ 实测：登录 control.katabump.com 后会停在根路径 https://control.katabump.com/ ，
+ *    那个页面是服务器列表/空页，**没有** Start 按钮。
+ *    真正的 Start / Stop / Power 按钮和运行状态在：
+ *        https://control.katabump.com/server/<id>     ← 就是 Access server 的 Link
+ */
+async function gotoServerPage(page) {
+    const target = SERVER_CREDENTIALS.link || '';
+    if (!target) {
+        console.log('   >> ⚠️ 没有 Link，无法定位服务器控制页');
+        return page;
+    }
+    const cur = page.url();
+    if (cur.includes('/server/')) {
+        console.log('   >> 已在服务器控制页:', cur);
+        return page;
+    }
+    try {
+        console.log('   >> 正在进入服务器控制页:', target);
+        await page.goto(target, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await page.waitForTimeout(4000);
+        console.log('   >> 当前地址:', page.url());
+        // 登录后可能被重定向到根路径 / 服务器列表页
+        if (!page.url().includes('/server/')) {
+            console.log('   >> 被重定向到服务器列表页，尝试点 "Manage server"...');
+            const btn = page.getByText('Manage server', { exact: true }).first();
+            const ok = await btn.waitFor({ state: 'visible', timeout: 5000 })
+                .then(() => btn.click({ timeout: 8000 }))
+                .then(() => true).catch(() => false);
+            if (ok) {
+                await page.waitForTimeout(4000);
+                console.log('   >> 已进入服务器详情页:', page.url());
+            } else {
+                console.log('   >> ⚠️ 未找到 "Manage server" 按钮');
+            }
+        }
+    } catch (e) {
+        console.log('   >> 进入服务器控制页失败:', e.message);
+    }
+    return page;
+}
+
+/**
  * 找并点击启动按钮（在 control.katabump.com 控制面板上）。
  *
  * 实测按钮文案可能是 Start / Power On / Start server / Boot 等，
@@ -589,6 +645,7 @@ async function ensureControlLogin(page) {
 async function clickStart(page) {
     const candidates = [
         page.getByRole('button', { name: 'Start', exact: true }),
+        page.getByRole('button', { name: 'Start Server', exact: true }),
         page.getByRole('button', { name: 'Start server', exact: true }),
         page.getByRole('button', { name: 'Power On', exact: true }),
         page.getByRole('button', { name: 'Power', exact: true }),
@@ -596,6 +653,7 @@ async function clickStart(page) {
         page.getByRole('button', { name: /power/i }),
         page.getByRole('link', { name: /start/i }),
         page.getByText(/^start$/i),
+        page.getByText(/^start server$/i),
         page.getByText(/^power on$/i),
     ];
     for (const c of candidates) {
@@ -841,7 +899,12 @@ async function clickStart(page) {
                 page = ctrlPage;
                 await page.addInitScript(INJECTED_SCRIPT).catch(() => {});
             }
-            await ensureControlLogin(page);
+            const loginOk = await ensureControlLogin(page);
+            if (loginOk) {
+                // ⚠️ 登录后会停在 control.katabump.com 根路径，那里没有 Start 按钮。
+                //    必须进到服务器控制页 /server/<id> 才能看到启动控件。
+                await gotoServerPage(page);
+            }
 
             // --- 读状态 ---
             let status = await readServerStatus(page);
@@ -894,7 +957,12 @@ async function clickStart(page) {
                         SERVER_CREDENTIALS = await readServerCredentials(page);
                         const back = await gotoControlPanel(page);
                         if (back && back !== page) page = back;
-                        await ensureControlLogin(page);
+                        if (await ensureControlLogin(page)) {
+                            await gotoServerPage(page);
+                        }
+                    } else if (!page.url().includes('/server/')) {
+                        // 掉回根路径了，也要重新进服务器控制页
+                        await gotoServerPage(page);
                     }
                 } catch (e) { /* ignore */ }
                 finalStatus = await readServerStatus(page);
