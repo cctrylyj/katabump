@@ -1,5 +1,5 @@
 # ===== KataBump 节点 · Clash / mihomo 配置 (v4 Node 版) =====
-# 由容器内 index.js 自动生成，端口列表 = 容器实际监听的端口
+# 由 CI 自动刷新（fetch_subscription.js），参数来自容器内 node-info.json
 mixed-port: 7890
 allow-lan: false
 mode: rule
