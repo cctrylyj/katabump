@@ -1,0 +1,14 @@
+{
+  "server": "147.135.213.131",
+  "uuid": "217b2cc6-bb12-4e16-8946-214368ef282f",
+  "private_key": "yDCHhturrdBLK92I1b3-zGCU0H6NzG4cvnjsTLOId0w",
+  "public_key": "tPUfR3E6-zSPQ389x3lBgRYGp_3xa2gt5AHbhag-_xE",
+  "short_id": "894ca02e",
+  "sni": "www.microsoft.com",
+  "ports": [
+    20330,
+    20331,
+    20332,
+    20333
+  ]
+}
