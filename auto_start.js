@@ -251,41 +251,70 @@ async function readServerStatus(page) {
  * 所以流程是：dashboard 服务器页 → 切 Access server 标签 → 读 Link → 跳 control 面板
  */
 async function gotoControlPanel(page) {
-    // 方案 1：直接点 "Go to server" 按钮（它会跳到 control 面板）
+    // 方案 1：点 "Go to server"。
+    // 注意它不一定是 <button>，可能是 <a> 或 <div>，所以用 text 匹配更保险。
     try {
-        const btn = page.getByRole('button', { name: 'Go to server', exact: true });
-        await btn.first().waitFor({ state: 'visible', timeout: 4000 });
-        await btn.first().click();
-        await page.waitForTimeout(4000);
+        const btn = page.getByText('Go to server', { exact: true }).first();
+        await btn.waitFor({ state: 'visible', timeout: 5000 });
+        await btn.click({ timeout: 8000 }).catch(() => {});
+        await page.waitForTimeout(5000);
         if (page.url().includes('control.katabump.com')) {
             console.log('   >> 已通过 "Go to server" 跳到控制面板');
             await ensureControlLogin(page);
             return true;
         }
+        // 可能在新标签页打开了
+        const pages = page.context().pages();
+        const ctrl = pages.find((p) => p.url().includes('control.katabump.com'));
+        if (ctrl) {
+            console.log('   >> 控制面板在新标签页打开了');
+            await ensureControlLogin(ctrl);
+            return true;
+        }
     } catch (e) { /* 试下一招 */ }
 
-    // 方案 2：从 Link 字段读地址直接跳
+    // 方案 2：从页面上任何地方提取 control.katabump.com 的 URL
     try {
         const link = await page.evaluate(() => {
-            const els = Array.from(document.querySelectorAll('input[readonly],code,pre,span,div'));
-            for (const el of els) {
-                const v = (el.value || el.textContent || '').trim();
-                if (/^https:\/\/control\.katabump\.com\/server\//.test(v)) return v;
+            const all = Array.from(document.querySelectorAll('*'));
+            for (const el of all) {
+                const vals = [el.value, el.textContent, el.href, el.getAttribute('href')]
+                    .filter(v => typeof v === 'string');
+                for (const v of vals) {
+                    const m = v.match(/https:\/\/control\.katabump\.com\/[^\s"'<>]+/);
+                    if (m) return m[0];
+                }
             }
             return '';
         });
         if (link) {
             console.log('   >> 控制面板地址:', link);
             await page.goto(link, { waitUntil: 'domcontentloaded', timeout: 30000 });
-            await page.waitForTimeout(3000);
+            await page.waitForTimeout(4000);
             console.log('   >> 已跳转到控制面板');
             await ensureControlLogin(page);
             return true;
         }
     } catch (e) { /* ignore */ }
 
-    // 方案 3：直接在 dashboard 上找 Start 按钮（老版面板结构，兼容）
+    // 方案 3：当前页直接找 Start 按钮（老版面板结构，兼容）
     console.log('   >> ⚠️ 未能跳到控制面板，尝试在当前页直接找启动按钮');
+    // 诊断：把页面上所有含 katabump.com 的文本 dump 出来
+    try {
+        const urls = await page.evaluate(() => {
+            const out = new Set();
+            for (const el of document.querySelectorAll('*')) {
+                for (const v of [el.value, el.textContent, el.href]) {
+                    if (typeof v === 'string' && v.includes('katabump.com') && v.length < 200) {
+                        const m = v.match(/[a-z]*:\/\/[^\s"'<>]*katabump\.com[^\s"'<>]*/i);
+                        if (m) out.add(m[0]);
+                    }
+                }
+            }
+            return Array.from(out).slice(0, 15);
+        });
+        console.log('   >> 页面上出现的 katabump 链接:', JSON.stringify(urls, null, 1));
+    } catch (e) { /* ignore */ }
     return false;
 }
 
