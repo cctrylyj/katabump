@@ -147,12 +147,88 @@ async function isTurnstilePassed(page) {
     return false;
 }
 
+/**
+ * 切到 "Access server" 标签页。
+ *
+ * ⚠️ 关键：KataBump 的服务器状态和 Start 按钮不在 "General" 页，
+ *    而在 "🚀 Access server" 这个子标签里。
+ *    只在 General 页找，永远读到 unknown、也永远找不到启动按钮。
+ *
+ * 这个元素在 DOM 里可能是 <a> / <div> / <button>，
+ * 而且 getByText 可能匹配到多个（外层容器 + 文字节点），
+ * 所以逐个候选试，最后用 JS 直接点文本节点兜底。
+ */
+async function switchToAccessServerTab(page) {
+    const candidates = [
+        page.getByRole('tab', { name: /access server/i }),
+        page.getByRole('link', { name: /access server/i }),
+        page.getByRole('button', { name: /access server/i }),
+        page.getByText('Access server', { exact: true }),
+        page.getByText(/access server/i),
+        page.locator('text=Access server'),
+    ];
+    for (const c of candidates) {
+        try {
+            await c.first().waitFor({ state: 'visible', timeout: 3000 });
+            await c.first().click({ timeout: 5000 });
+            await page.waitForTimeout(2000);
+            console.log('   >> 已切换到 "Access server" 标签页');
+            return true;
+        } catch (e) { /* try next */ }
+    }
+
+    // 兜底：直接在页面里找含 "Access server" 的元素并用 JS 点击
+    try {
+        const done = await page.evaluate(() => {
+            const els = Array.from(document.querySelectorAll('a,button,div,span,li,p'));
+            const hit = els.find((el) => {
+                const t = (el.textContent || '').trim();
+                return /access server/i.test(t) && t.length < 40;
+            });
+            if (!hit) return false;
+            hit.click();
+            return true;
+        });
+        if (done) {
+            await page.waitForTimeout(2000);
+            console.log('   >> 已切换到 "Access server" 标签页（JS 兜底）');
+            return true;
+        }
+    } catch (e) { /* ignore */ }
+
+    console.log('   >> 未找到 "Access server" 标签（可能面板改版了）');
+    return false;
+}
+
 /** 读取页面上服务器状态文本 */
 async function readServerStatus(page) {
+    // 优先看状态徽章 —— 面板上状态通常是个小圆点 + 文字，
+    // 直接看徽章比扫全页文本准得多（避免 "online" 之类的词出现在别处）
+    try {
+        const badge = await page.evaluate(() => {
+            // 找带 class 含 badge / status / pill / dot 的小元素
+            const els = Array.from(document.querySelectorAll(
+                '[class*="badge"],[class*="status"],[class*="pill"],[class*="dot"],[class*="indicator"]'));
+            for (const el of els) {
+                const t = (el.textContent || '').trim();
+                if (t && t.length < 30) return t;
+            }
+            return '';
+        });
+        if (badge) {
+            const b = badge.toLowerCase();
+            if (/offline|stopped|已停止|已离线/.test(b)) return 'offline';
+            if (/running|online|运行中|在线/.test(b)) return 'running';
+            if (/starting|启动中/.test(b)) return 'starting';
+            if (/crash|崩溃/.test(b)) return 'crashed';
+        }
+    } catch (e) { /* ignore */ }
+
+    // 退回全页文本匹配
     const body = await page.locator('body').innerText().catch(() => '');
     const lower = body.toLowerCase();
     if (/\boffline\b|stopped|已停止|已离线/.test(lower)) return 'offline';
-    if (/\brunning\b|online|运行中|在线/.test(lower)) return 'running';
+    if (/\brunning\b|运行中/.test(lower)) return 'running';
     if (/\bstarting\b|starting up|启动中/.test(lower)) return 'starting';
     if (/\bcrashed\b|崩溃/.test(lower)) return 'crashed';
     return 'unknown';
@@ -165,8 +241,10 @@ async function clickStart(page) {
         page.getByRole('button', { name: /start/i }),
         page.getByRole('button', { name: 'Power', exact: true }),
         page.getByRole('button', { name: 'Power On', exact: true }),
+        page.getByRole('button', { name: /power/i }),
         page.getByRole('link', { name: /start/i }),
         page.getByText(/^start$/i),
+        page.getByText(/^power on$/i),
     ];
     for (const c of candidates) {
         try {
@@ -353,6 +431,9 @@ async function clickStart(page) {
             }
 
             // --- 读状态 ---
+            // 必须先切到 "Access server" 标签页 —— 状态和 Start 按钮都在那里
+            await switchToAccessServerTab(page);
+
             let status = await readServerStatus(page);
             console.log('   >> 当前状态:', status);
 
@@ -375,6 +456,15 @@ async function clickStart(page) {
                 console.log('   >> ❌ 未找到启动按钮。');
                 const shotPath = path.join(photoDir, `${safeUser}_no_start_btn.png`);
                 try { await page.screenshot({ path: shotPath, fullPage: true }); } catch (e) { /* ignore */ }
+                // 把页面上所有按钮/链接的文案 dump 出来，方便定位
+                try {
+                    const btns = await page.evaluate(() => Array.from(
+                        document.querySelectorAll('button,a[role="button"],input[type="submit"],input[type="button"]'))
+                        .map((e) => ((e.innerText || e.value || e.textContent || '').trim() +
+                                    (e.disabled ? ' [disabled]' : '')))
+                        .filter((t) => t && t.length < 40));
+                    console.log('   >> 页面上可见的按钮/链接:', JSON.stringify(btns));
+                } catch (e) { /* ignore */ }
                 await sendTelegram(`⚠️ *自动启动未找到按钮*\n用户: ${user.username}\n状态: ${status}`, shotPath);
                 continue;
             }
@@ -386,6 +476,8 @@ async function clickStart(page) {
                 try {
                     await page.reload({ waitUntil: 'domcontentloaded' });
                     await page.waitForTimeout(2000);
+                    // reload 后页面回到默认的 General 标签，要重新切过去
+                    await switchToAccessServerTab(page);
                 } catch (e) { /* ignore */ }
                 finalStatus = await readServerStatus(page);
                 console.log(`   >> 等待中... 状态: ${finalStatus}`);
