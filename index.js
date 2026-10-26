@@ -619,6 +619,16 @@ function buildConfig(ports, uuid, privKey, shortId, sni) {
         privateKey: privKey,
         shortIds: [shortId],
       },
+      // ---------------------------------------------------------------
+      // 传输层优化（2026-10-26 加入）
+      // ---------------------------------------------------------------
+      // 节点在法国 OVH，从国内过去 RTT ≈ 239ms。
+      // 高 RTT 下 Nagle 算法会把小包攒着一起发，
+      // 导致「请求发出去了但迟迟不回」——体感就是「卡」。
+      // tcpNoDelay 关闭 Nagle，小包立即发出去，显著降低首字节延迟。
+      sockopt: {
+        tcpNoDelay: true,
+      },
     },
     sniffing: { enabled: true, destOverride: ['http', 'tls', 'quic'], routeOnly: true },
   }));
