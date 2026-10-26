@@ -669,7 +669,64 @@ async function clickStart(page) {
         } catch (e) { /* try next */ }
     }
 
-    // 兜底：JS 直接点含 start / power 的按钮
+    // --- 兜底 1：Pterodactyl 控制面板详情页左上角的电源按钮组 ---
+    // 实测截图：服务器详情页左上角（服务器名下、侧边栏右上方）是三个图标按钮：
+    //   绿色 ▶（Start）  🔄（Restart）  红色 ⏹（Stop）
+    // 绿色那个是**纯图标、没有文字**，所以上面的文本定位全都匹配不到。
+    // Pterodactyl 用 FontAwesome，所以 class 里会带 fa-play / fa-stop / fa-redo。
+    try {
+        const clicked = await page.evaluate(() => {
+            const ICON = /play|power|start/i;
+            const STOP = /stop|kill|power-off|shutdown|\bfa-stop\b/i;
+            const cls = (el) => {
+                const c = el.className;
+                if (!c) return '';
+                if (typeof c === 'string') return c;
+                if (c.baseVal !== undefined) return c.baseVal;   // SVG
+                return '';
+            };
+            const attrs = (el) => ((el.getAttribute('title') || '') + ' ' +
+                (el.getAttribute('aria-label') || '') + ' ' +
+                (el.getAttribute('data-original-title') || '') + ' ' +
+                (el.getAttribute('data-bs-title') || '') + ' ' +
+                (el.getAttribute('data-bs-original-title') || '') + ' ' +
+                cls(el)).toString();
+
+            // 只看真正的可点击元素，按文档顺序（绿色 ▶ 在最左）
+            const all = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+            for (const el of all) {
+                const a = attrs(el);
+                if (!ICON.test(a)) continue;
+                if (STOP.test(a)) continue;
+                const r = el.getBoundingClientRect();
+                if (!r || (r.width === 0 && r.height === 0)) continue;
+                el.click();
+                return true;
+            }
+
+            // 再退一步：class 含 fa-play 的元素（可能是 <i>），点它的可点击祖先
+            const fa = Array.from(document.querySelectorAll('[class*="fa-play"],[class*="fa-power"]'));
+            for (const el of fa) {
+                if (STOP.test(attrs(el))) continue;
+                let p = el;
+                for (let k = 0; k < 5 && p; k++, p = p.parentElement) {
+                    if (p.tagName === 'BUTTON' || p.tagName === 'A') {
+                        const r = p.getBoundingClientRect();
+                        if (r && (r.width > 0 || r.height > 0)) { p.click(); return true; }
+                    }
+                }
+                el.click();
+                return true;
+            }
+            return false;
+        });
+        if (clicked) {
+            console.log('   >> 找到启动按钮（图标兜底），点击中...');
+            return true;
+        }
+    } catch (e) { /* ignore */ }
+
+    // --- 兜底 2：JS 直接点含 start / power 的按钮 ---
     try {
         const clicked = await page.evaluate(() => {
             const els = Array.from(document.querySelectorAll('button,a,[role="button"]'));
@@ -938,6 +995,27 @@ async function clickStart(page) {
                                     (e.disabled ? ' [disabled]' : '')))
                         .filter((t) => t && t.length < 40));
                     console.log('   >> 页面上可见的按钮/链接:', JSON.stringify(btns));
+                } catch (e) { /* ignore */ }
+                // 诊断：dump 电源按钮组（纯图标按钮，文本是空的）
+                try {
+                    const power = await page.evaluate(() => Array.from(
+                        document.querySelectorAll('button, a, [role="button"]'))
+                        .map((e) => {
+                            const c = e.className;
+                            const cls = typeof c === 'string' ? c : (c && c.baseVal) || '';
+                            return {
+                                tag: e.tagName,
+                                title: e.getAttribute('title') || '',
+                                aria: e.getAttribute('aria-label') || '',
+                                cls: String(cls).slice(0, 60),
+                                disabled: !!e.disabled,
+                                text: (e.innerText || '').trim().slice(0, 20),
+                            };
+                        })
+                        .filter((x) => /play|power|stop|redo|start|fa-/i.test(
+                            x.title + ' ' + x.aria + ' ' + x.cls))
+                        .slice(0, 12));
+                    console.log('   >> [诊断] 电源/图标按钮:', JSON.stringify(power, null, 1));
                 } catch (e) { /* ignore */ }
                 await sendTelegram(`⚠️ *自动启动未找到按钮*\n用户: ${user.username}\n状态: ${status}`, shotPath);
                 continue;
