@@ -263,8 +263,23 @@ function verifyPorts(info, ports) {
         const VERIFY_TARGET = process.env.VERIFY_URL || 'http://www.gstatic.com/generate_204';
         const xray = findXray();
         if (!xray) {
-            log('⚠️ 找不到 xray 可执行文件，跳过端口回测（全部端口都发布）');
-            return { usable: ports.slice(), results: ports.map((p) => ({ port: p, ok: true, detail: '未回测' })) };
+            // ⚠️ 降级必须是「保守」的：
+            // 拿不到 xray 就无法证明端口可用，若此时把全部端口都发布出去，
+            // 会把平台面板端口 / 未映射端口一起塞进订阅 —— 客户端会连到
+            // 别人的服务或直接失败，表现为「时好时坏」。
+            // 所以这里只发布第一个端口（KataBump 的主端口），
+            // 并在 node-info.json 里标记未回测，等下次有 xray 时再自动修正。
+            log('⚠️ 找不到 xray 可执行文件，端口回测跳过（保守降级：只发布首个端口）');
+            const fallback = ports.length ? [ports[0]] : [];
+            return {
+                usable: fallback,
+                results: ports.map((p) => ({
+                    port: p,
+                    ok: p === fallback[0],
+                    detail: p === fallback[0] ? '未回测(保守放行)' : '未回测(保守剔除)',
+                })),
+                degraded: true,
+            };
         }
 
         for (const p of ports) {
@@ -282,13 +297,22 @@ function findXray() {
     const isWin = process.platform === 'win32';
     const cands = [
         process.env.XRAY_PATH,
+        // CI 里由 "Download xray" 步骤解压到工作目录根
+        path.join(ROOT, 'xray-linux-amd64'),
+        path.join(ROOT, 'xray-linux-64', 'xray'),
         // Linux(CI) 用无扩展名的二进制；Windows 用 .exe
-        isWin ? path.join(ROOT, 'xray.exe') : path.join(ROOT, 'xray-linux-amd64'),
+        isWin ? path.join(ROOT, 'xray.exe') : path.join(ROOT, 'xray'),
         path.join(ROOT, '本地工具', 'xray.exe'),          // Windows 本地备选
-        isWin ? null : path.join(ROOT, 'xray'),
         isWin ? path.join(ROOT, 'xray-linux-amd64.exe') : null,
     ].filter(Boolean);
-    for (const c of cands) { if (fs.existsSync(c)) return c; }
+    for (const c of cands) {
+        if (!fs.existsSync(c)) continue;
+        try {
+            // 必须是「可执行文件」而不是同名目录
+            if (!fs.statSync(c).isFile()) continue;
+        } catch (e) { continue; }
+        return c;
+    }
     return null;
 }
 
