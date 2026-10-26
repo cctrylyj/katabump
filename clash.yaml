@@ -1,0 +1,48 @@
+# ===== KataBump 节点 · Clash / mihomo 配置 (v4 Node 版) =====
+# 由容器内 index.js 自动生成，端口列表 = 容器实际监听的端口
+mixed-port: 7890
+allow-lan: false
+mode: rule
+log-level: info
+ipv6: false
+external-controller: 127.0.0.1:9090
+unified-delay: true
+tcp-concurrent: true
+
+proxies:
+  - name: "KataBump-20330"
+    type: vless
+    server: 147.135.213.131
+    port: 20330
+    uuid: 217b2cc6-bb12-4e16-8946-214368ef282f
+    udp: true
+    tls: true
+    network: tcp
+    flow: xtls-rprx-vision
+    servername: www.microsoft.com
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: tPUfR3E6-zSPQ389x3lBgRYGp_3xa2gt5AHbhag-_xE
+      short-id: "894ca02e"
+      # Xray v26.7.11+ 要求 ClientHello 带后量子混合密钥交换
+      # 缺这一行 mihomo 会一直报 REALITY authentication failed
+      support-x25519mlkem768: true
+
+proxy-groups:
+  - name: "节点选择"
+    type: select
+    proxies:
+      - "KataBump-20330"
+      - DIRECT
+  - name: "自动测速"
+    type: url-test
+    proxies:
+      - "KataBump-20330"
+    url: http://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 50
+
+rules:
+  - GEOIP,LAN,DIRECT,no-resolve
+  - GEOIP,CN,DIRECT
+  - MATCH,节点选择
