@@ -533,11 +533,13 @@ tcp-concurrent: true
 # 关闭 Nagle 算法。
 # 节点在法国 OVH，国内过去 RTT ≈ 239ms —— 高延迟下 Nagle 会把小包攒着一起发，
 # 导致「请求发出去了但迟迟不回」，体感就是「卡」。
-# 2026-10-26 实测（7 次取中位数）：开启后单连接吞吐 234 → 609 KB/s（+160%）。
+# 2026-10-26 实测（7 次取中位数，每次 8MB）：
+#   基准（无优化）      234 KB/s
+#   tcp-no-delay        609 KB/s  (+160%)
+#   tcp-no-delay + 1MB  1031 KB/s (+340%)  ← 当前配置
+# 注意：不要开 tcp-fast-open —— 实测反而更慢（中位 123 KB/s），
+# TFO cookie 需要一次往返建立，239ms RTT 下收益为负。
 tcp-no-delay: true
-# 注意：不要开 tcp-fast-open。
-# 实测 TFO 反而更慢（中位 123 KB/s）—— 服务端在另一台机器上，
-# TFO cookie 需要往返建立，高 RTT 下收益为负。
 
 proxies:
 ${proxies}
