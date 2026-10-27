@@ -29,19 +29,19 @@ proxies:
       support-x25519mlkem768: true
   - name: "CF-Tunnel"
     type: vless
-    server: welding-images-idaho-dramatic.trycloudflare.com
+    server: node.cctry.kdns.fr
     port: 443
     uuid: c1822444-06cd-4fec-8699-aa2b703ba1fa
     udp: true
     tls: true
     network: ws
-    servername: welding-images-idaho-dramatic.trycloudflare.com
+    servername: node.cctry.kdns.fr
     client-fingerprint: chrome
     skip-cert-verify: false
     ws-opts:
       path: /vless
       headers:
-        Host: welding-images-idaho-dramatic.trycloudflare.com
+        Host: node.cctry.kdns.fr
 
 proxy-groups:
   - name: "节点选择"
