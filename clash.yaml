@@ -1,5 +1,5 @@
 # ===== KataBump 节点 · Clash / mihomo 配置 (v4 Node 版) =====
-# 由 CI 自动刷新（fetch_subscription.js），参数来自容器内 node-info.json
+# 由容器内 index.js 自动生成，端口列表 = 容器实际监听的端口
 mixed-port: 7890
 allow-lan: false
 mode: rule
@@ -8,16 +8,6 @@ ipv6: false
 external-controller: 127.0.0.1:9090
 unified-delay: true
 tcp-concurrent: true
-# 关闭 Nagle 算法。
-# 节点在法国 OVH，国内过去 RTT ≈ 239ms —— 高延迟下 Nagle 会把小包攒着一起发，
-# 导致「请求发出去了但迟迟不回」，体感就是「卡」。
-# 2026-10-26 实测（7 次取中位数，每次 8MB）：
-#   基准（无优化）      234 KB/s
-#   tcp-no-delay        609 KB/s  (+160%)
-#   tcp-no-delay + 1MB  1031 KB/s (+340%)  ← 当前配置
-# 注意：不要开 tcp-fast-open —— 实测反而更慢（中位 123 KB/s），
-# TFO cookie 需要一次往返建立，239ms RTT 下收益为负。
-tcp-no-delay: true
 
 proxies:
   - name: "KataBump-20330"
@@ -37,17 +27,34 @@ proxies:
       # Xray v26.7.11+ 要求 ClientHello 带后量子混合密钥交换
       # 缺这一行 mihomo 会一直报 REALITY authentication failed
       support-x25519mlkem768: true
+  - name: "CF-Tunnel"
+    type: vless
+    server: welding-images-idaho-dramatic.trycloudflare.com
+    port: 443
+    uuid: c1822444-06cd-4fec-8699-aa2b703ba1fa
+    udp: true
+    tls: true
+    network: ws
+    servername: welding-images-idaho-dramatic.trycloudflare.com
+    client-fingerprint: chrome
+    skip-cert-verify: false
+    ws-opts:
+      path: /vless
+      headers:
+        Host: welding-images-idaho-dramatic.trycloudflare.com
 
 proxy-groups:
   - name: "节点选择"
     type: select
     proxies:
       - "KataBump-20330"
+      - "CF-Tunnel"
       - DIRECT
   - name: "自动测速"
     type: url-test
     proxies:
       - "KataBump-20330"
+      - "CF-Tunnel"
     url: http://www.gstatic.com/generate_204
     interval: 300
     tolerance: 50

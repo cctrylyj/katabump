@@ -10,30 +10,5 @@
     20331,
     20332,
     20333
-  ],
-  "usable_ports": [
-    20330
-  ],
-  "port_check": [
-    {
-      "port": 20330,
-      "ok": true,
-      "detail": "HTTP 204"
-    },
-    {
-      "port": 20331,
-      "ok": false,
-      "detail": "不可用"
-    },
-    {
-      "port": 20332,
-      "ok": false,
-      "detail": "不可用"
-    },
-    {
-      "port": 20333,
-      "ok": false,
-      "detail": "不可用"
-    }
   ]
 }

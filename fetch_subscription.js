@@ -474,6 +474,12 @@ async function main() {
         const pubPorts = usable.length ? usable : [20330];
         const yml = buildClash(info, pubPorts);
         const links = pubPorts.map((p) => buildLink(info, p));
+        // Cloudflare 隧道节点（如果容器里启用了）
+        const cf = (info.cf && info.cf.enabled) ? info.cf : null;
+        if (cf) {
+            links.push(buildCfLink(cf));
+            log(`✅ 追加 Cloudflare 隧道节点: ${cf.hostname}${cf.path}`);
+        }
         const sub = Buffer.from(links.join('\n'), 'utf8').toString('base64');
 
         const files = {
@@ -502,6 +508,8 @@ async function main() {
 }
 
 function buildClash(info, ports) {
+    const cf = (info.cf && info.cf.enabled) ? info.cf : null;
+
     const proxies = ports.map((p) => `  - name: "KataBump-${p}"
     type: vless
     server: ${info.server}
@@ -518,8 +526,32 @@ function buildClash(info, ports) {
       short-id: "${info.short_id}"
       # Xray v26.7.11+ 要求 ClientHello 带后量子混合密钥交换
       # 缺这一行 mihomo 会一直报 REALITY authentication failed
-      support-x25519mlkem768: true`).join('\n');
-    const gl = ports.map((p) => `      - "KataBump-${p}"`).join('\n');
+      support-x25519mlkem768: true`);
+
+    const names = ports.map((p) => `KataBump-${p}`);
+
+    // ---- Cloudflare 隧道节点 ----
+    // 走 CF 边缘 + 骨干网回源，绕开「国内 -> 法国 OVH」这条拥塞窗口被掐死的线路。
+    if (cf) {
+        proxies.push(`  - name: "CF-Tunnel"
+    type: vless
+    server: ${cf.hostname}
+    port: 443
+    uuid: ${cf.uuid}
+    udp: true
+    tls: true
+    network: ws
+    servername: ${cf.hostname}
+    client-fingerprint: chrome
+    skip-cert-verify: false
+    ws-opts:
+      path: ${cf.path}
+      headers:
+        Host: ${cf.hostname}`);
+        names.push('CF-Tunnel');
+    }
+
+    const gl = names.map((n) => `      - "${n}"`).join('\n');
     return `# ===== KataBump 节点 · Clash / mihomo 配置 (v4 Node 版) =====
 # 由 CI 自动刷新（fetch_subscription.js），参数来自容器内 node-info.json
 mixed-port: 7890
@@ -531,25 +563,33 @@ external-controller: 127.0.0.1:9090
 unified-delay: true
 tcp-concurrent: true
 # 关闭 Nagle 算法（保留，默认开着；关掉没有副作用）。
-# 起因：节点在法国 OVH，国内过去 RTT ≈ 269ms，高延迟下 Nagle 会把小包攒着一起发，
-# 导致「请求发出去了但迟迟不回」，体感就是「卡」。
 #
-# ⚠️ 关于效果的重要更正（2026-10-26 晚间）：
-# 初版注释写的「+160% / +340%」是单次采样的假象，不可复现。
-# 后续 4 组独立对照实验 + 各 3~7 次采样取中位，证明真正根因是
-# **这条跨境线路 11% 的丢包率**（ICMP 实测 100 包丢 11%，对照 8.8.8.8 只丢 3%），
-# TCP 拥塞窗口被反复腰斩，吞吐按 Mathis 公式塌陷到
-#     BW = MSS / (RTT × √p) = 1448 / (0.269 × √0.11) ≈ 16 KB/s
-# 与实测单流 20~50 KB/s 吻合。
+# ⚠️ 关于速度根因的准确表述（2026-10-27 实测再修正）：
+# 早前注释写的「+160% / +340%」是单次采样假象，不可复现。
+# 症状是 **这条跨境线路的单流 TCP 拥塞窗口在某些时段从一开始就被掐死**：
+#   经节点单连接连续下载 6MB × 5 次 -> 恒定 13~17 KB/s，从第一秒起就长不大；
+#   直连 Cloudflare 边缘同样 6MB × 5 次 -> 235→446→686→830→1016 KB/s 持续上升；
+#   两条链路的 TCP 握手都是 100% 成功（60/60），CF 的 p50 RTT(183ms) 甚至
+#   比节点(248ms) 更低 —— 说明链路没断，是这条特定线路的窗口被限制。
+# 同一节点开多条独立连接可线性叠加（16 路 = 343 KB/s），属客户端唯一有效手段。
 # tcp-no-delay / bufferSize / TFO / mptcp / tcpKeepAlive 全部实测无显著差异，
 # 但保留 tcp-no-delay 无害且符合直觉，继续开着。
+#
+# ⚠️⚠️ 两个重要补充（2026-10-27）：
+#   1) 上面那批「13 KB/s」的读数**本身被测速脚本放大了**（计时起点算上了
+#      SOCKS 握手 + 缓冲区丢字节），修正后同一脚本低 2.2×。
+#      正确测速实现见 本地工具/verify_speed_truth.js。
+#   2) 这条线路**存在明显的时段性波动**：同一脚本 10-26 晚测得经节点 13 KB/s、
+#      10-27 早测得 1512 KB/s（同期直连 CF 天花板从 1016 涨到 18780 KB/s）。
+#      所以症状是「周期性变慢」，不是「永久限速」。
+#      CF-Tunnel 节点（走 CF 骨干网）的价值就是绕开这个波动。
 #
 # ⚠️ 不要开 tcp-fast-open：TFO cookie 需要一次往返建立，
 # 高 RTT 下收益为负，实测反而更慢。
 tcp-no-delay: true
 
 proxies:
-${proxies}
+${proxies.join('\n')}
 
 proxy-groups:
   - name: "节点选择"
@@ -579,6 +619,15 @@ function buildLink(info, port) {
         type: 'tcp', headerType: 'none',
     });
     return `vless://${info.uuid}@${info.server}:${port}?${q.toString()}#${encodeURIComponent('KataBump-' + port)}`;
+}
+
+/** Cloudflare 隧道节点分享链接（VLESS + WS + TLS） */
+function buildCfLink(cf) {
+    const q = new URLSearchParams({
+        encryption: 'none', security: 'tls', type: 'ws',
+        host: cf.hostname, path: cf.path, sni: cf.hostname, fp: 'chrome',
+    });
+    return `vless://${cf.uuid}@${cf.hostname}:443?${q.toString()}#${encodeURIComponent('CF-Tunnel')}`;
 }
 
 main().then((c) => process.exit(c || 0)).catch((e) => {

@@ -90,6 +90,70 @@ const MIRRORS = [
   'https://gh.llkk.cc/' + BASE_URL,
 ];
 
+// ------------------------------------------------------------ Cloudflare 隧道
+// 背景（2026-10-26 实测）：
+//   国内 -> 法国 OVH 这条线路的 TCP 拥塞窗口从一开始就被掐死，
+//   单流稳定在 13~17 KB/s；而国内 -> Cloudflare 边缘同条件单流能跑
+//   235 -> 1016 KB/s（持续上升）。说明瓶颈是这条特定线路，不是"国内出国"本身。
+//   把 cloudflared 跑在本容器里，流量改走
+//       国内 -> CF 边缘(实测健康) -> CF 骨干网 -> 本容器
+//   就完全绕开了坏掉的那段直连。
+//
+// 关键点：cloudflared 连的是本机回环端口，不需要新增外网 allocation
+//（KataBump 只给了 1 个端口 20330，且无法自助增加）。
+//
+// ⚠️ token 从哪里来（实测 KataBump 面板现状）：
+//   Startup 页的 Variables 区只有 egg 预定义的 NODE_PACKAGES / BOT_JS_FILE，
+//   **没有自定义环境变量入口**。所以优先级设计成：
+//     1) 环境变量 CF_TUNNEL_TOKEN（如果哪天平台支持了）
+//     2) 同目录的 cf-config.json（推荐，可用 Files 页随时改，不用碰 index.js）
+//     3) 都没有 -> 完全不启用，对现有行为零影响
+const CF_CONFIG_PATH = path.join(WORKDIR, 'cf-config.json');
+
+function readCfConfigFile() {
+  try {
+    if (!fs.existsSync(CF_CONFIG_PATH)) return {};
+    const raw = fs.readFileSync(CF_CONFIG_PATH, 'utf8').trim();
+    if (!raw) return {};
+    const j = JSON.parse(raw);
+    return (j && typeof j === 'object') ? j : {};
+  } catch (e) {
+    log('⚠️ cf-config.json 解析失败，忽略: ' + (e && e.message ? e.message : e));
+    return {};
+  }
+}
+
+const CF_FILE_CFG = readCfConfigFile();
+const CF_TUNNEL_TOKEN = (
+  (process.env.CF_TUNNEL_TOKEN || '').trim() ||
+  (CF_FILE_CFG.tunnel_token || '').trim()
+);
+// 模式：
+//   'token' —— 正式隧道，用 tunnel_token 连 Cloudflare 后台建好的隧道
+//   'quick' —— 临时测试隧道（cloudflared --url），不需要账号，
+//              每次重启会拿到一个随机 trycloudflare.com 域名
+//   没配 CF_TUNNEL_TOKEN 且没写 mode=quick -> 完全不启用
+const CF_MODE = CF_FILE_CFG.mode === 'quick' ? 'quick' : (CF_TUNNEL_TOKEN ? 'token' : 'off');
+const CF_HOSTNAME = (
+  (process.env.CF_HOSTNAME || '').trim() ||
+  (CF_FILE_CFG.hostname || '').trim()
+);
+const CF_WS_PATH = (
+  (process.env.CF_WS_PATH || '').trim() ||
+  (CF_FILE_CFG.path || '').trim() ||
+  '/vless'
+);
+const CF_LOCAL_PORT = parseInt(
+  (process.env.CF_LOCAL_PORT || '').trim() || CF_FILE_CFG.local_port || 20399, 10);
+const CF_ENABLED = CF_MODE !== 'off';
+const CLOUDFLARED_BIN = path.join(WORKDIR, 'cloudflared');
+const CF_LOGFILE = path.join(WORKDIR, 'cloudflared.log');
+const CF_PIDFILE = path.join(WORKDIR, 'cloudflared.pid');
+const CLOUDFLARED_VERSION = process.env.CLOUDFLARED_VERSION || 'latest';
+const CLOUDFLARED_ASSET = IS_ARM ? 'cloudflared-linux-arm64' : 'cloudflared-linux-amd64';
+const CLOUDFLARED_URL =
+  `https://github.com/cloudflare/cloudflared/releases/${CLOUDFLARED_VERSION}/download/${CLOUDFLARED_ASSET}`;
+
 let stopping = false;
 
 function log(msg) {
@@ -598,8 +662,271 @@ async function verifyPorts(xrayBin, ip, ports, uuid, pubKey, shortId, sni) {
   }
   return { usable, results };
 }
+// ------------------------------------------------------------ Cloudflare 隧道
+/**
+ * 找 cloudflared 二进制。
+ * 优先用用户手动上传的；否则从 GitHub Releases 下载。
+ */
+function findCloudflared() {
+  const cands = [
+    CLOUDFLARED_BIN,
+    path.join(WORKDIR, 'bin', 'cloudflared'),
+    path.join(WORKDIR, 'cloudflared-linux-' + (IS_ARM ? 'arm64' : 'amd64')),
+  ];
+  for (const p of cands) {
+    try {
+      if (fs.existsSync(p) && fs.statSync(p).isFile()) {
+        try { fs.chmodSync(p, 0o755); } catch (e) { /* ignore */ }
+        return p;
+      }
+    } catch (e) { /* ignore */ }
+  }
+  return null;
+}
+
+/**
+ * 下载 cloudflared。单个二进制文件（不是 zip），直接写流即可。
+ *
+ * 三个坑（2026-10-26 实战踩过）：
+ *   1. GitHub 的 /releases/latest/download/ **必然 302** 跳转到 objects.githubusercontent.com，
+ *      必须自己跟随重定向，不能靠 https.get 自动跳（Node 默认不跟）。
+ *   2. 写流必须**每次尝试新建**。共用一个 WriteStream 的话，
+ *      中途 close() 会触发 'close' 事件 → 校验逻辑跑在文件还没写完的时候 → 误判。
+ *   3. 下载过程要落一份日志到磁盘，否则容器 stdout 一关就查不到失败原因。
+ */
+function downloadCloudflared() {
+  return new Promise((resolve, reject) => {
+    const tmp = path.join(WORKDIR, '.cloudflared-download');
+    const dlog = path.join(WORKDIR, 'cloudflared-download.log');
+
+    // 单独一组镜像：路径结构和 xray 不同，不能复用 MIRRORS
+    const cfMirrors = [
+      CLOUDFLARED_URL,
+      'https://ghfast.top/' + CLOUDFLARED_URL,
+      'https://gh-proxy.com/' + CLOUDFLARED_URL,
+      'https://ghproxy.net/' + CLOUDFLARED_URL,
+      'https://gh.llkk.cc/' + CLOUDFLARED_URL,
+    ];
+
+    const dlogLine = (m) => {
+      try { fs.appendFileSync(dlog, m + '\n'); } catch (e) { /* ignore */ }
+      log(m);
+    };
+
+    const cleanup = () => { try { fs.unlinkSync(tmp); } catch (e) { /* ignore */ } };
+
+    // 跟随重定向地下载单个 URL（最多 5 跳）
+    const fetchToFile = (url, redirectsLeft, cb) => {
+      const req = https.get(url, {
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+        timeout: 240000,
+      }, (res) => {
+        const st = res.statusCode;
+
+        if (st >= 300 && st < 400 && res.headers.location) {
+          res.resume();
+          if (redirectsLeft <= 0) return cb(new Error('重定向次数过多'));
+          const next = new URL(res.headers.location, url).toString();
+          dlogLine('    → 302 跳转到: ' + next.slice(0, 120));
+          return fetchToFile(next, redirectsLeft - 1, cb);
+        }
+
+        if (st !== 200) {
+          res.resume();
+          return cb(new Error('HTTP ' + st));
+        }
+
+        const out = fs.createWriteStream(tmp);
+        let downloaded = 0;
+        res.on('data', (c) => { downloaded += c.length; });
+        out.on('error', (e) => { cleanup(); cb(e); });
+        res.on('error', (e) => { cleanup(); cb(e); });
+        out.on('close', () => {
+          try {
+            const size = fs.statSync(tmp).size;
+            if (size < 5 * 1024 * 1024) {
+              cleanup();
+              return cb(new Error(`下载文件过小 (${size}B)，可能被拦截`));
+            }
+            fs.renameSync(tmp, CLOUDFLARED_BIN);
+            try { fs.chmodSync(CLOUDFLARED_BIN, 0o755); } catch (e) { /* ignore */ }
+            dlogLine('  完成: ' + CLOUDFLARED_BIN + ` (${(size / 1048576).toFixed(1)} MB)`);
+            cb(null);
+          } catch (e) {
+            cleanup();
+            cb(e);
+          }
+        });
+        res.pipe(out);
+      });
+      req.on('error', (e) => cb(new Error(e.message)));
+      req.on('timeout', () => { req.destroy(); cb(new Error('超时')); });
+    };
+
+    const attempt = (idx) => {
+      if (idx >= cfMirrors.length) {
+        cleanup();
+        return reject(new Error(
+          `cloudflared 下载全部失败。\n解决：上传 cloudflared-linux-${IS_ARM ? 'arm64' : 'amd64'} 到 ${WORKDIR}/`
+        ));
+      }
+      const url = cfMirrors[idx];
+      dlogLine(`  尝试源: ${url.split('/')[2]}`);
+      fetchToFile(url, 5, (err) => {
+        if (!err) return resolve(CLOUDFLARED_BIN);
+        dlogLine('    失败: ' + err.message);
+        attempt(idx + 1);
+      });
+    };
+
+    dlogLine(`开始下载 cloudflared（${CLOUDFLARED_ASSET}）...`);
+    attempt(0);
+  });
+}
+
+/**
+ * 启动 cloudflared 隧道。
+ *   token 模式：连 Cloudflare 后台建好的隧道，需要 tunnel token
+ *   quick  模式：临时隧道，不需要账号，随机 trycloudflare.com 域名
+ */
+function startCloudflared(bin) {
+  // 磁盘日志：容器 stdout 看不到，任何失败都要能通过 Files API 查证
+  const tlog = path.join(WORKDIR, 'cloudflared-supervise.log');
+  const tlogLine = (m) => {
+    try { fs.appendFileSync(tlog, new Date().toISOString() + ' ' + m + '\n'); } catch (e) { /* ignore */ }
+    log(m);
+  };
+
+  let out;
+  try {
+    out = fs.openSync(CF_LOGFILE, 'a');
+  } catch (e) {
+    tlogLine('❌ 打开 CF_LOGFILE 失败: ' + (e && e.message ? e.message : e));
+    throw e;
+  }
+
+  const args = CF_MODE === 'quick'
+    ? ['tunnel', '--no-autoupdate', '--url', `http://localhost:${CF_LOCAL_PORT}`]
+    : ['tunnel', '--no-autoupdate', 'run', '--token', CF_TUNNEL_TOKEN];
+
+  tlogLine(`启动 cloudflared: ${bin} ${args.join(' ')}`);
+
+  let child;
+  try {
+    child = spawn(bin, args, {
+      detached: true,
+      stdio: ['ignore', out, out],
+    });
+  } catch (e) {
+    tlogLine('❌ spawn 抛异常: ' + (e && e.message ? e.message : e));
+    throw e;
+  }
+
+  child.on('error', (e) => {
+    tlogLine('❌ 子进程 error 事件: ' + (e && e.message ? e.message : e));
+  });
+  child.on('exit', (code, signal) => {
+    tlogLine(`cloudflared 退出: code=${code} signal=${signal}`);
+  });
+
+  child.unref();
+  try { fs.writeFileSync(CF_PIDFILE, String(child.pid)); } catch (e) { /* ignore */ }
+  tlogLine(`cloudflared 已 spawn，pid=${child.pid}`);
+  return child;
+}
+
+/**
+ * 从 cloudflared.log 里提取 quick 模式分配的随机域名。
+ */
+function readQuickHostname() {
+  try {
+    const txt = fs.readFileSync(CF_LOGFILE, 'utf8');
+    const m = txt.match(/https:\/\/([a-z0-9-]+\.trycloudflare\.com)/i);
+    return m ? m[1] : '';
+  } catch (e) { return ''; }
+}
+
+function readCfPid() {
+  try { return parseInt(fs.readFileSync(CF_PIDFILE, 'utf8').trim(), 10) || null; } catch (e) { return null; }
+}
+
+function isCfAlive() {
+  const pid = readCfPid();
+  if (!pid) return false;
+  try { process.kill(pid, 0); return true; } catch (e) { return false; }
+}
+
+async function stopCloudflared() {
+  const killed = [];
+  const pid = readCfPid();
+  if (pid && isCfAlive()) {
+    try { process.kill(pid, 'SIGTERM'); killed.push(`cloudflared(pid=${pid})`); } catch (e) { /* ignore */ }
+  }
+  await sleep(1000);
+  const more = await killPatternsAsync(['cloudflared']);
+  killed.push(...more);
+  try { fs.unlinkSync(CF_PIDFILE); } catch (e) { /* ignore */ }
+  if (killed.length) log('已停止隧道: ' + killed.join(', '));
+  return killed;
+}
+
+/**
+ * 隧道守护：cloudflared 崩了自动重连。
+ * 独立于 xray 的守护循环，互不影响。
+ *
+ * quick 模式的关键点：随机域名要等 cloudflared 起来之后才知道，
+ * 所以起来之后要等几秒、拿到域名、再把 node-info.json / clash.yaml 重新生成一次。
+ */
+async function superviseCloudflared(bin, info, onHostnameReady) {
+  log('进入隧道守护模式，cloudflared 掉线会自动重连。');
+  let child = null;
+  try {
+    while (!stopping) {
+      try { fs.closeSync(fs.openSync(CF_LOGFILE, 'w')); } catch (e) { /* ignore */ }
+      child = startCloudflared(bin);
+      log(`cloudflared 已启动，pid=${child.pid}`);
+
+      // 等域名（quick 模式）
+      if (CF_MODE === 'quick' && onHostnameReady) {
+        for (let i = 0; i < 30; i++) {
+          await sleep(2000);
+          const h = readQuickHostname();
+          if (h) {
+            log('隧道随机域名: ' + h);
+            try { await onHostnameReady(h); } catch (e) { log('域名就绪后更新配置失败: ' + e.message); }
+            break;
+          }
+        }
+      }
+
+      while (!stopping && child.exitCode === null && child.signalCode === null) {
+        await sleep(3000);
+      }
+      if (stopping) break;
+      log('cloudflared 意外退出，5 秒后重连...');
+      await sleep(5000);
+    }
+  } finally {
+    if (child && child.exitCode === null) {
+      try { child.kill('SIGTERM'); } catch (e) { /* ignore */ }
+      await sleep(1500);
+      try { child.kill('SIGKILL'); } catch (e) { /* ignore */ }
+    }
+    try { fs.unlinkSync(CF_PIDFILE); } catch (e) { /* ignore */ }
+  }
+}
+
 // ------------------------------------------------------------ 配置生成
-function buildConfig(ports, uuid, privKey, shortId, sni) {
+/**
+ * 生成 xray 配置。
+ *
+ * 两个 inbound：
+ *   1. TCP + REALITY（20330 等）—— 直连用，走的是坏掉的那条线路
+ *   2. WS（仅监听 127.0.0.1:20399）—— 给 cloudflared 用，走 CF 骨干网
+ *
+ * WS inbound 只绑回环，不对外暴露，所以不需要额外 allocation。
+ */
+function buildConfig(ports, uuid, privKey, shortId, sni, cf) {
   const inbounds = ports.map((p) => ({
     listen: '0.0.0.0',
     port: p,
@@ -622,14 +949,22 @@ function buildConfig(ports, uuid, privKey, shortId, sni) {
       // ---------------------------------------------------------------
       // 传输层优化（2026-10-26 加入）
       // ---------------------------------------------------------------
-      // 节点在法国 OVH，从国内过去 RTT ≈ 239ms。
-      // 高 RTT 下 Nagle 算法会把小包攒着一起发，
-      // 导致「请求发出去了但迟迟不回」——体感就是「卡」。
-      // 客户端侧实测（7 次取中位数，每次 8MB）：
-      //   基准                234 KB/s
-      //   tcpNoDelay          609 KB/s  (+160%)
-      //   tcpNoDelay+buffer1M 1031 KB/s (+340%)
-      // bufferSize 放大收发缓冲区，减少高延迟下的往返等待。
+      // 节点在法国 OVH，从国内过去 RTT ≈ 248ms。
+      //
+      // ⚠️ 效果说明（2026-10-26 晚间实测后修正）：
+      // 最初注释写的「+160% / +340%」是单次采样的假象，不可复现。
+      // 后续多组独立对照实验证明，真正根因是
+      // **这条跨境线路的 TCP 拥塞窗口从一开始就被掐死**：
+      // 单连接连续下载 6MB × 5 次，速度恒定在 13~17 KB/s，
+      // 从第一秒起就长不大（对比：直连 Cloudflare 边缘同样是 6MB × 5 次，
+      // 速度 235 → 446 → 686 → 830 → 1016 KB/s 持续上升）。
+      // 同一节点开多条独立连接可线性叠加（16 路 = 343 KB/s），
+      // 说明 TCP 握手没问题、链路没断，是单流窗口被限制。
+      // tcpNoDelay / bufferSize / TFO / mptcp / tcpKeepAlive 全部实测无显著差异，
+      // 但保留 tcpNoDelay 无害且符合直觉，继续开着。
+      //
+      // ⚠️ 不要开 tcp-fast-open：TFO cookie 需要一次往返建立，
+      // 高 RTT 下收益为负，实测反而更慢。
       sockopt: {
         tcpNoDelay: true,
         bufferSize: 1048576,   // 1 MB
@@ -637,6 +972,28 @@ function buildConfig(ports, uuid, privKey, shortId, sni) {
     },
     sniffing: { enabled: true, destOverride: ['http', 'tls', 'quic'], routeOnly: true },
   }));
+
+  // ---- Cloudflare 隧道落地端：VLESS + WebSocket，只绑回环 ----
+  if (cf && cf.enabled) {
+    inbounds.push({
+      listen: '127.0.0.1',
+      port: cf.local_port,
+      protocol: 'vless',
+      settings: {
+        clients: [{ id: cf.uuid }],
+        decryption: 'none',
+      },
+      streamSettings: {
+        network: 'ws',
+        security: 'none',
+        wsSettings: {
+          path: cf.path,
+          acceptProxyProtocol: false,
+        },
+      },
+      sniffing: { enabled: true, destOverride: ['http', 'tls', 'quic'], routeOnly: true },
+    });
+  }
 
   return {
     log: { loglevel: 'warning', access: 'none' },
@@ -672,7 +1029,24 @@ function vlessLink(ip, port, uuid, pubKey, shortId, sni, name) {
   return `vless://${uuid}@${ip}:${port}?${q.toString()}#${encodeURIComponent(name)}`;
 }
 
-function clashYaml(ip, ports, uuid, pubKey, shortId, sni) {
+/**
+ * Cloudflare 隧道节点的分享链接（VLESS + WS + TLS）。
+ * 客户端连的是 CF 边缘的 443，走 CF 骨干网回源到本容器。
+ */
+function cfVlessLink(cf, name) {
+  const q = new URLSearchParams({
+    encryption: 'none',
+    security: 'tls',
+    type: 'ws',
+    host: cf.hostname,
+    path: cf.path,
+    sni: cf.hostname,
+    fp: 'chrome',
+  });
+  return `vless://${cf.uuid}@${cf.hostname}:443?${q.toString()}#${encodeURIComponent(name)}`;
+}
+
+function clashYaml(ip, ports, uuid, pubKey, shortId, sni, cf) {
   const proxies = ports.map((p) => {
     const nm = `KataBump-${p}`;
     return `  - name: "${nm}"
@@ -692,9 +1066,32 @@ function clashYaml(ip, ports, uuid, pubKey, shortId, sni) {
       # Xray v26.7.11+ 要求 ClientHello 带后量子混合密钥交换
       # 缺这一行 mihomo 会一直报 REALITY authentication failed
       support-x25519mlkem768: true`;
-  }).join('\n');
+  });
 
   const names = ports.map((p) => `KataBump-${p}`);
+
+  // ---- Cloudflare 隧道节点 ----
+  // quick 模式启动瞬间还没拿到随机域名，此时先不写进订阅，
+  // 等域名分配下来会重新生成一次。
+  if (cf && cf.enabled && cf.hostname) {
+    proxies.push(`  - name: "CF-Tunnel"
+    type: vless
+    server: ${cf.hostname}
+    port: 443
+    uuid: ${cf.uuid}
+    udp: true
+    tls: true
+    network: ws
+    servername: ${cf.hostname}
+    client-fingerprint: chrome
+    skip-cert-verify: false
+    ws-opts:
+      path: ${cf.path}
+      headers:
+        Host: ${cf.hostname}`);
+    names.push('CF-Tunnel');
+  }
+
   const groupList = names.map((n) => `      - "${n}"`).join('\n');
 
   return `# ===== KataBump 节点 · Clash / mihomo 配置 (v4 Node 版) =====
@@ -709,7 +1106,7 @@ unified-delay: true
 tcp-concurrent: true
 
 proxies:
-${proxies}
+${proxies.join('\n')}
 
 proxy-groups:
   - name: "节点选择"
@@ -739,8 +1136,10 @@ function saveAndReport(info) {
   const ports = (info.usable_ports && info.usable_ports.length)
     ? info.usable_ports
     : (info.ports || []);
-  const yml = clashYaml(server, ports, uuid, public_key, short_id, sni);
+  const cf = info.cf || null;
+  const yml = clashYaml(server, ports, uuid, public_key, short_id, sni, cf);
   const links = ports.map((p) => vlessLink(server, p, uuid, public_key, short_id, sni, `KataBump-${p}`));
+  if (cf && cf.enabled && cf.hostname) links.push(cfVlessLink(cf, 'CF-Tunnel'));
 
   fs.writeFileSync(INFO_PATH, JSON.stringify(info, null, 2), 'utf8');
   fs.writeFileSync(path.join(WORKDIR, 'clash.yaml'), yml, 'utf8');
@@ -763,6 +1162,14 @@ function saveAndReport(info) {
   console.log('  publicKey: ' + public_key);
   console.log('  shortId  : ' + short_id);
   console.log('  伪装 SNI : ' + sni);
+  if (cf && cf.enabled) {
+    console.log(bar);
+    console.log('  【Cloudflare 隧道】');
+    console.log('  模式     : ' + (cf.mode || 'token'));
+    console.log('  域名     : ' + (cf.hostname || '(等待 cloudflared 分配随机域名...)'));
+    console.log('  WS 路径  : ' + cf.path);
+    console.log('  隧道UUID : ' + cf.uuid);
+  }
   console.log(bar);
   console.log('  【分享链接】');
   for (const l of links) console.log('  ' + l);
@@ -800,6 +1207,25 @@ function statusXray() {
         for (const l of tail.split('\n').slice(-15)) log('   ' + l);
       }
     } catch (e) { /* ignore */ }
+  }
+
+  // ---- Cloudflare 隧道状态 ----
+  if (CF_ENABLED) {
+    const cfAlive = isCfAlive();
+    log('隧道: ' + (cfAlive ? `运行中 (pid=${readCfPid()})` : '未运行'));
+    log('  域名: ' + (CF_HOSTNAME || '(未设置 CF_HOSTNAME)'));
+    log('  路径: ' + CF_WS_PATH + '  本地端口: ' + CF_LOCAL_PORT);
+    if (fs.existsSync(CF_LOGFILE)) {
+      try {
+        const tail = fs.readFileSync(CF_LOGFILE, 'utf8').slice(-1500).trim();
+        if (tail) {
+          log('--- cloudflared.log 尾部 ---');
+          for (const l of tail.split('\n').slice(-12)) log('   ' + l);
+        }
+      } catch (e) { /* ignore */ }
+    }
+  } else {
+    log('隧道: 未启用（缺 CF_TUNNEL_TOKEN）');
   }
   return alive;
 }
@@ -857,6 +1283,52 @@ async function detectPorts() {
 }
 
 // ------------------------------------------------------------ 主流程
+/**
+ * 准备 Cloudflare 隧道配置段。
+ * 没有 CF 配置时返回 null，对现有行为零影响。
+ */
+function prepareCf(info) {
+  if (!CF_ENABLED) {
+    log('未配置 Cloudflare 隧道，跳过。（要启用见 Cloudflare隧道加速方案.md）');
+    return null;
+  }
+
+  // 隧道 UUID 独立于 REALITY 节点的 UUID，互不影响。
+  // 已存在就复用，保证重启后订阅里的 UUID 不变。
+  let cfUuid = (info.cf && info.cf.uuid) || '';
+  if (!cfUuid) {
+    cfUuid = randomUuid();
+    log('生成隧道专用 UUID: ' + cfUuid);
+  }
+
+  if (CF_MODE === 'quick') {
+    log('隧道模式: quick（临时域名，不需要 Cloudflare 账号）');
+    return {
+      enabled: true,
+      mode: 'quick',
+      hostname: '',          // 域名要等 cloudflared 起来才知道
+      path: CF_WS_PATH,
+      local_port: CF_LOCAL_PORT,
+      uuid: cfUuid,
+    };
+  }
+
+  if (!CF_HOSTNAME) {
+    log('⚠️ 有 CF_TUNNEL_TOKEN 但没有 CF_HOSTNAME，隧道无法生成节点配置，跳过。');
+    return null;
+  }
+
+  log('隧道模式: token（域名 ' + CF_HOSTNAME + '）');
+  return {
+    enabled: true,
+    mode: 'token',
+    hostname: CF_HOSTNAME,
+    path: CF_WS_PATH,
+    local_port: CF_LOCAL_PORT,
+    uuid: cfUuid,
+  };
+}
+
 async function loadOrCreate(reset, setIp) {
   let info = null;
   if (!reset && fs.existsSync(INFO_PATH)) {
@@ -886,9 +1358,12 @@ async function loadOrCreate(reset, setIp) {
   info.ports = listenPorts;
   // info.usable_ports = 实际可用的端口（回测后填充）
 
-  const cfg = buildConfig(listenPorts, info.uuid, info.private_key, info.short_id, info.sni);
+  const cf = prepareCf(info);
+  if (cf) info.cf = cf;
+
+  const cfg = buildConfig(listenPorts, info.uuid, info.private_key, info.short_id, info.sni, cf);
   fs.writeFileSync(CONF_PATH, JSON.stringify(cfg, null, 2), 'utf8');
-  return { xray, info, listenPorts };
+  return { xray, info, listenPorts, cf };
 }
 
 function startXray(xray, confPath) {
@@ -902,8 +1377,11 @@ function startXray(xray, confPath) {
   return child;
 }
 
-/** 守护模式：前台常驻，xray 崩溃自动重启；SIGTERM 优雅退出 */
-async function supervise(xray, confPath) {
+/**
+ * 守护模式：前台常驻，xray 崩溃自动重启；SIGTERM 优雅退出。
+ * 如果启用了 Cloudflare 隧道，隧道守护并行跑，互不影响。
+ */
+async function supervise(xray, confPath, cf, info) {
   const onSignal = (sig) => {
     stopping = true;
     log(`收到信号 ${sig}，正在退出...`);
@@ -912,6 +1390,25 @@ async function supervise(xray, confPath) {
   process.on('SIGINT', () => onSignal('SIGINT'));
 
   log('进入守护模式，xray 崩溃会自动重启。面板 Stop 可正常结束本进程。');
+
+  // 隧道守护并行跑：xray 和 cloudflared 各有各的重启循环
+  let cfTask = null;
+  if (cf && cf.enabled) {
+    cfTask = (async () => {
+      try {
+        const bin = findCloudflared() || (await downloadCloudflared());
+        await sleep(1500);
+        // quick 模式：域名拿到后要重新生成 clash.yaml / sub.txt / node-info.json
+        const onReady = CF_MODE === 'quick' ? async (hostname) => {
+          info.cf = Object.assign({}, info.cf, { hostname, mode: 'quick' });
+          saveAndReport(info);
+        } : null;
+        await superviseCloudflared(bin, info, onReady);
+      } catch (e) {
+        log('❌ 隧道守护启动失败: ' + (e && e.message ? e.message : e));
+      }
+    })();
+  }
 
   let child = null;
   try {
@@ -934,6 +1431,8 @@ async function supervise(xray, confPath) {
       try { child.kill('SIGKILL'); } catch (e) { /* ignore */ }
     }
     try { fs.unlinkSync(PIDFILE); } catch (e) { /* ignore */ }
+    if (cf && cf.enabled) await stopCloudflared();
+    if (cfTask) { try { await cfTask; } catch (e) { /* ignore */ } }
     log('已退出。');
   }
   return 0;
@@ -942,14 +1441,18 @@ async function supervise(xray, confPath) {
 async function main() {
   const args = process.argv.slice(2);
 
-  if (args.includes('--stop')) { await stopXray(); return 0; }
+  if (args.includes('--stop')) {
+    await stopXray();
+    if (CF_ENABLED) await stopCloudflared();
+    return 0;
+  }
   if (args.includes('--status')) { statusXray(); return 0; }
 
   let setIp = null;
   const si = args.indexOf('--set-ip');
   if (si >= 0 && args[si + 1]) setIp = args[si + 1];
 
-  const { xray, info, listenPorts } = await loadOrCreate(args.includes('--reset'), setIp);
+  const { xray, info, listenPorts, cf } = await loadOrCreate(args.includes('--reset'), setIp);
   info.listen_ports = listenPorts;
 
   // ---- 先把 xray 拉起来，再回测端口 ----
@@ -983,7 +1486,7 @@ async function main() {
 
   if (args.includes('--gen') || args.includes('--info')) return 0;
 
-  return supervise(xray, CONF_PATH);
+  return supervise(xray, CONF_PATH, cf, info);
 }
 
 main().then((code) => { process.exit(code || 0); }).catch((e) => {
